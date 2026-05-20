@@ -18,6 +18,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+User=ubuntu
 Type=simple
 EnvironmentFile=${ENV_FILE}
 Environment=OCI_AUTH_MODE=instance_principal
@@ -40,6 +41,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+User=ubuntu
 Type=simple
 EnvironmentFile=${ENV_FILE}
 WorkingDirectory=${SRC}
@@ -59,6 +61,7 @@ cat > /tmp/cloud-lab-heartbeat.service <<SERVICE
 Description=Cloud Lab heartbeat — sends fleet status to owner via ntfy
 
 [Service]
+User=ubuntu
 Type=oneshot
 EnvironmentFile=${ENV_FILE}
 Environment=OCI_AUTH_MODE=instance_principal
@@ -88,6 +91,7 @@ cat > /tmp/cloud-lab-crosswatch.service <<SERVICE
 Description=Cloud Lab cross-watch — checks peer VMs via OCI, alerts if down
 
 [Service]
+User=ubuntu
 Type=oneshot
 EnvironmentFile=${ENV_FILE}
 Environment=OCI_AUTH_MODE=instance_principal
@@ -117,6 +121,7 @@ cat > /tmp/cloud-lab-update.service <<SERVICE
 Description=Cloud Lab self-update — git pull fleet repo
 
 [Service]
+User=ubuntu
 Type=oneshot
 WorkingDirectory=$HOME/cloud-lab
 ExecStart=/usr/bin/git pull --ff-only
@@ -149,4 +154,4 @@ echo ""
 echo "Services: cloud-lab-orchestrator, cloud-lab-console"
 echo "Timers:   cloud-lab-heartbeat (12h), cloud-lab-crosswatch (6h), cloud-lab-update (nightly)"
 echo ""
-echo "Admin console: https://$(grep ^ADMIN_DOMAIN $ENV_FILE | cut -d= -f2)"
+echo "Admin console: https://$(grep ^ADMIN_DOMAIN "$ENV_FILE" | cut -d= -f2)"

@@ -16,6 +16,7 @@ cat > /tmp/cloud-lab-heartbeat.service <<SERVICE
 Description=Cloud Lab worker heartbeat — POSTs liveness to management console
 
 [Service]
+User=ubuntu
 Type=oneshot
 EnvironmentFile=${ENV_FILE}
 WorkingDirectory=${TOOLS_DIR}
@@ -44,6 +45,7 @@ cat > /tmp/cloud-lab-crosswatch.service <<SERVICE
 Description=Cloud Lab cross-watch — checks peer VMs, ntfy direct alert if down
 
 [Service]
+User=ubuntu
 Type=oneshot
 EnvironmentFile=${ENV_FILE}
 Environment=OCI_AUTH_MODE=instance_principal
@@ -73,6 +75,7 @@ cat > /tmp/cloud-lab-update.service <<SERVICE
 Description=Cloud Lab self-update — git pull fleet repo
 
 [Service]
+User=ubuntu
 Type=oneshot
 WorkingDirectory=$HOME/cloud-lab
 ExecStart=/usr/bin/git pull --ff-only

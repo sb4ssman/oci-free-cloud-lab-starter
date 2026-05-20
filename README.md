@@ -1,273 +1,260 @@
-# Oracle Free Cloud Lab
+# Oracle Free Cloud Lab Starter
 
-A complete, self-managing cloud lab built on Oracle Cloud's Always Free tier.
-Provisions 3 VMs, keeps them alive indefinitely, and hands you a secure web admin
-portal — then gets out of your way so you can build whatever you want on top.
+Fork this repo, fill in a `.env`, run one script — and watch three Oracle Cloud VMs
+build themselves. The management VM comes up first and takes over: it provisions the
+worker VM, then runs a continuous lottery loop until Oracle hands over the big A1 Flex
+machine. You can watch the whole cascade from the admin portal that comes up
+automatically on the management VM.
+
+Once the lab is running, it keeps itself alive and self-heals indefinitely. You layer
+your own workloads on top.
+
+> **LLM-friendly:** point your favorite AI at this repo (or a clone of it) and ask it
+> to walk you through setup — the structure is designed for that.
+
+---
+
+## How it builds itself
+
+```
+You run launch-management  →  Management VM boots (cloud-init, ~5 min)
+                                  ↓
+                           Admin console comes up at https://your-domain.duckdns.org
+                                  ↓
+                           Fleet orchestrator starts, reads fleet.json
+                                  ↓
+                           Launches worker VM  (micro, ~3 min)
+                                  ↓
+                           Starts A1 Flex lottery loop for lab-vm  (hours–days)
+                                  ↓
+                           lab-vm wins capacity, boots, checks in via heartbeat
+```
+
+You are watching a self-assembling cloud lab. The only manual step after the first
+script is updating your DuckDNS record and the IP values in `.env` as VMs come up.
+
+---
+
+## Pre-flight checklist
+
+Complete all of these before running anything.
+
+- [ ] **Oracle Cloud account** — free tier is enough; verify your tenancy is active
+- [ ] **OCI CLI installed and authenticated** — run `oci setup config` and confirm
+      `oci iam user get --user-id <your-ocid>` works
+      ([install guide](https://docs.oracle.com/en-us/iaas/Content/API/SDKDocs/cliinstall.htm))
+- [ ] **Python 3.10+** — the admin scripts run locally on your machine
+- [ ] **SSH key pair** — generate one at `~/.ssh/fleet.key` if you don't have one:
+      `ssh-keygen -t ed25519 -f ~/.ssh/fleet.key`
+- [ ] **DuckDNS account + subdomain** — free at [duckdns.org](https://www.duckdns.org/).
+      You need this for the admin console's HTTPS certificate.
+- [ ] **ntfy topic name** — free at [ntfy.sh](https://ntfy.sh/). Pick any unique string;
+      this is how the fleet notifies you. (Optional but strongly recommended.)
+- [ ] **GitHub account** — you need to fork this repo so VMs can clone your copy.
+      Create a read-only [personal access token](https://github.com/settings/tokens)
+      with `repo` scope for the `GITHUB_TOKEN` in `.env`.
 
 ---
 
 ## Quickstart
 
-```bash
-# 1. Clone this repo and work from inside it
-git clone https://github.com/your-username/oci-free-cloud-lab-starter.git cloud-lab
-cd cloud-lab
+### 1. Fork this repo
 
-# 2. Configure
-cp .env.example .env
-#    Edit .env — fill in OCI credentials, FLEET_REPO, GITHUB_TOKEN, ADMIN_PASSWORD
-python admin/hash_password.py    # generates ADMIN_PASSWORD_HASH; paste into .env
+Click **Fork** on GitHub. The VMs will clone your fork — they need access to a repo
+you control so you can customize `fleet.json` and the payload layer.
 
-# 3. Create network resources (run once)
-#    Windows:
-admin\setup-oci-network.bat
-#    Mac/Linux:
-bash admin/setup-oci-network.sh
-
-# 4. Launch the management VM
-#    Windows:
-admin\launch-management.bat
-#    Mac/Linux:
-bash admin/launch-management.sh
-
-# 5. The management VM's orchestrator launches worker and lab-vm automatically.
-#    Check status:
-#    Windows:
-admin\check-all-vms.bat
-#    Mac/Linux:
-bash admin/check-all-vms.sh
-```
-
-> **All admin scripts must be run from inside the repo directory.** The scripts resolve
-> paths relative to their own location — running them from elsewhere will fail.
-
----
-
-## What you get
-
-| | |
-|---|---|
-| **3 permanent VMs** | `management` (Micro), `worker` (Micro), `lab-vm` (A1 Flex 4 OCPU/24 GB) |
-| **Admin console** | HTTPS web portal at your DuckDNS domain — fleet status at a glance |
-| **Fleet orchestrator** | Watches `fleet.json`; relaunches any VM that disappears |
-| **Cross-watch** | Each VM monitors peers and fires an ntfy alert if any go down |
-| **Push notifications** | ntfy heartbeats, daily fleet reports, anomaly alerts |
-| **Keepalive** | Cron jobs that satisfy Oracle's idle-reclamation policy with real CPU work |
-
-Your three VMs and their roles:
-
-```
-management   VM.Standard.E2.1.Micro    Orchestrator, admin console, heartbeat
-worker       VM.Standard.E2.1.Micro    General compute — yours to use
-lab-vm       VM.Standard.A1.Flex       4 OCPU / 24 GB RAM — your main resource
-```
-
----
-
-## Prerequisites
-
-- Oracle Cloud account (Always Free tier)
-- OCI CLI installed and authenticated (`oci setup config`)
-  - [Install guide](https://docs.oracle.com/en-us/iaas/Content/API/SDKDocs/cliinstall.htm) — available for Linux, macOS, and Windows
-- Python 3.10+ (the admin scripts run locally)
-- An SSH key pair for fleet VM access
-- A [DuckDNS](https://www.duckdns.org/) account and subdomain (free)
-- A [ntfy.sh](https://ntfy.sh/) topic name (free, or self-hosted)
-
----
-
-## Setup walkthrough
-
-### Step 1 — Configure `.env`
+### 2. Clone your fork and configure
 
 ```bash
+git clone https://github.com/YOUR_USERNAME/oci-free-cloud-lab-starter.git
+cd oci-free-cloud-lab-starter
+
 cp .env.example .env
+# Edit .env — see the comments; every field is explained
 ```
 
-Edit `.env`. The required fields are:
-
-| Variable | What it is |
-|---|---|
-| `OCI_*` | Your OCI credentials and resource IDs (from `oci setup config` + OCI console) |
-| `FLEET_REPO` | SSH URL of this repo — VMs clone it on first boot |
-| `GITHUB_TOKEN` | Read-only PAT (repo scope) so VMs can pull the repo |
-| `ADMIN_PASSWORD` | Password for the admin console web UI |
-| `ADMIN_PASSWORD_HASH` | PBKDF2 hash of the above — generated by `hash_password.py` |
-| `ADMIN_DOMAIN` | Your DuckDNS subdomain (e.g. `my-lab.duckdns.org`) |
-| `NOTIFY_NTFY_TOPIC` | Your ntfy topic name for push alerts |
-
-Generate the password hash:
-
+Generate your admin console password hash:
 ```bash
 python admin/hash_password.py
 # Paste the output into ADMIN_PASSWORD_HASH in .env
 ```
 
-The plaintext password never touches the VMs — only the hash is written there.
+### 3. Create OCI network resources (once)
 
-### Step 2 — Create network resources
-
-```bash
-# Windows
+**Windows:**
+```
 admin\setup-oci-network.bat
-
-# Mac/Linux
+```
+**Mac/Linux:**
+```bash
 bash admin/setup-oci-network.sh
 ```
 
-Creates a VCN, subnet, internet gateway, route table, and security rules in your
-OCI compartment. Outputs `OCI_VCN_ID` and `OCI_SUBNET_ID` — paste those into `.env`.
+This creates a VCN, subnet, internet gateway, route table, and security rules. Copy
+the output `OCI_VCN_ID` and `OCI_SUBNET_ID` values into `.env`.
 
-### Step 3 — Launch the management VM
+### 4. Launch the management VM
 
-```bash
-# Windows
+**Windows:**
+```
 admin\launch-management.bat
-
-# Mac/Linux
+```
+**Mac/Linux:**
+```bash
 bash admin/launch-management.sh
 ```
 
-Launches the management VM using `admin/profiles/management.json`. Cloud-init handles
-everything automatically: package installs, OCI CLI, Caddy, repo clone, systemd
-services, SSH key generation, and keepalive cron jobs. Takes 5–10 minutes.
+Wait 5–10 minutes for cloud-init to finish. Then:
+- Update `OCI_MANAGEMENT_HOST` in `.env` with the public IP
+- Update your DuckDNS record to point at that IP
+- Open `https://your-domain.duckdns.org` — your admin console is up
 
-Once it's up, update `OCI_MANAGEMENT_HOST` in `.env` with the public IP, then update
-your DuckDNS record to point at it.
+### 5. Watch it build
 
-Verify:
+The fleet orchestrator on the management VM handles everything from here. Check in
+from your machine at any time:
 
-```bash
-# Windows
-admin\ssh-vm.bat management
+**Windows:** `admin\check-all-vms.bat`
+**Mac/Linux:** `bash admin/check-all-vms.sh`
 
-# Mac/Linux
-bash admin/ssh-vm.sh management
-```
-
-### Step 4 — Let the orchestrator do the rest
-
-The fleet orchestrator on the management VM reads `fleet.json` and launches `worker`
-and `lab-vm` automatically. Lab-vm uses the A1 Flex shape, which is subject to
-Oracle's "out of host capacity" queue — it may take hours or days to win. The
-orchestrator retries silently until it succeeds.
-
-Check status from your local machine at any time:
-
-```bash
-# Windows
-admin\check-all-vms.bat
-
-# Mac/Linux
-bash admin/check-all-vms.sh
-```
+Or just watch the admin console — it auto-refreshes every 60 seconds and shows
+live VM state and heartbeat times.
 
 ---
 
 ## Admin scripts reference
 
-All scripts are in `admin/`. Run them from the repo root.
+All scripts are in `admin/`. Run them from the repo root. `.bat` for Windows,
+`.sh` for Mac/Linux — both call the same Python underneath.
 
 | Script | What it does |
 |---|---|
-| `setup-oci-network` | Create VCN, subnet, security rules — run once |
+| `setup-oci-network` | Create VCN/subnet/security rules — run once |
 | `launch-management` | Launch the management VM |
-| `check-all-vms` | Query OCI state + SSH probe all VMs |
-| `ssh-vm <name>` | SSH into any fleet VM (`management` / `worker` / `lab-vm`) |
-| `bootstrap-mgmt-vm` | Re-apply full setup to a running management VM |
-| `terminate-vm` | Terminate a VM by name |
+| `check-all-vms` | Query OCI state + SSH probe all VMs; updates `vm-profiles/` |
+| `ssh-vm <name>` | SSH into any fleet VM (`management`, `worker`, `lab-vm`) |
+| `bootstrap-mgmt-vm` | Re-apply full config to a running management VM |
+| `terminate-vm <name>` | Terminate a VM by name |
 | `hash_password.py` | Generate `ADMIN_PASSWORD_HASH` for `.env` |
-
-Windows wrappers (`.bat`) and POSIX wrappers (`.sh`) are provided for all scripts.
 
 ---
 
-## Layering your own workload
+## Fleet layout
 
-The `payload/` directory is where your project lives. `payload/keepalive/` ships
-with this repo and runs on every VM automatically. To add your own:
+Three VMs, two shapes — all within Oracle's Always Free tier:
 
-1. Create `payload/<your-project>/`
-2. Add an `install.sh` that idempotently sets up whatever you need
-3. Call it from `fleet/<role>/setup.sh`, or run it manually via SSH
+```
+management   VM.Standard.E2.1.Micro    Orchestrator · admin console · heartbeat · crosswatch
+worker       VM.Standard.E2.1.Micro    General compute — available for your workloads
+lab-vm       VM.Standard.A1.Flex       4 OCPU / 24 GB RAM — your main resource
+```
 
-See [payload/README.md](payload/README.md) for details.
-
-**Handing off to a separate project repo:** Once the fleet is up, hit `/export` in
-the admin console to get a block of env vars (VM IPs, SSH user, private IPs). Paste
-those into your project's `.env`. The fleet self-manages independently.
+VM configuration is in `fleet.json` (committed, safe to edit). Role-specific
+cloud-init and setup scripts live in `fleet/<role>/`. The management VM uses Caddy
+as a TLS-terminating reverse proxy in front of the admin console.
 
 ---
 
 ## What's automated vs. what you do manually
 
-| Automated | Manual |
+| Done for you automatically | You do this manually |
 |---|---|
-| VM provisioning and re-provisioning | `setup-oci-network` (once) |
-| Repo clone and updates on VMs | `launch-management` (once) |
-| All systemd service setup | DuckDNS record update after launch |
-| Fleet SSH key generation | Filling in `.env` |
-| TLS cert via Caddy + DuckDNS | Waiting for A1 Flex capacity (can take days) |
-| Peer health monitoring | Updating `OCI_*_HOST` values after re-launch |
-| Keepalive cron jobs | — |
-| A1 Flex retry loop | — |
+| All VM provisioning after management is up | Run `setup-oci-network` (once) |
+| Repo clone + updates on each VM | Run `launch-management` (once) |
+| All systemd service installation | Edit `.env` with your credentials |
+| Fleet SSH key generation on management VM | Update DuckDNS record after management VM launches |
+| TLS cert provisioning via Caddy + Let's Encrypt | Fill in `OCI_*_HOST` in `.env` as VMs come online |
+| Peer health monitoring across all VMs | Wait for A1 Flex capacity (hours to days — out of your hands) |
+| A1 Flex retry loop until capacity granted | — |
+| Self-healing: relaunch terminated VMs | — |
+| Keepalive: periodic CPU activity to prevent idle reclamation | — |
 
 ---
 
-## Oracle Always Free — things to know
+## Oracle Always Free — what you need to know
 
-**The idle-reclamation problem.** Oracle can reclaim Always Free VMs that appear
-idle (roughly: CPU below ~10% for 7 days). This repo solves it with real operational
-work — periodic health checks, log compression, and OCI API calls — rather than
-fake load. This is the right approach: Oracle's policy targets genuinely abandoned
-instances, not running workloads.
+**The idle-reclamation problem.**  Oracle can terminate Always Free VMs that appear
+idle (CPU below roughly 10% over 7 days). This repo solves it with real operational
+work — health checks, log compression, OCI API calls via cron — rather than fake load.
+The keepalive payload (`payload/keepalive/`) handles this automatically on every VM.
 
-**The A1 Flex lottery.** The `VM.Standard.A1.Flex` shape is in constant high demand.
-When you first launch `lab-vm`, Oracle will almost certainly return "out of host
-capacity." The fleet orchestrator retries automatically and indefinitely. Most people
-win within 24–72 hours; some wait longer. There is no way to speed this up. Just
-leave the orchestrator running.
+**The A1 Flex lottery.**  `VM.Standard.A1.Flex` is perpetually oversubscribed. Oracle
+will almost certainly return "Out of host capacity" on your first launch attempt. The
+fleet orchestrator retries silently and indefinitely. Most users win within 24–72 hours;
+some wait longer. There is no way to accelerate this. Leave the orchestrator running.
 
-**The 2-micro limit.** Always Free includes exactly 2 `VM.Standard.E2.1.Micro`
-instances. `management` and `worker` each use one. If you terminate both and try to
-re-launch simultaneously, Oracle sometimes refuses the second with a capacity error.
-Launch them sequentially or let the orchestrator handle it.
+**The 2-micro limit.**  Always Free includes exactly 2 `VM.Standard.E2.1.Micro`
+instances total. `management` and `worker` each use one. If you terminate both and
+try to relaunch simultaneously, Oracle may reject the second. Launch sequentially or
+let the orchestrator handle it.
 
-**Instance-principal auth.** VMs in this fleet authenticate to OCI via
-instance-principal — no API key on the VMs. The management VM needs the
-`allow dynamic-group cloud-lab-instances to use instance-family`
-policy in your tenancy, or equivalent. The network setup script creates this.
+**Instance-principal auth.**  VMs authenticate to OCI using instance-principal — no
+API key is stored on any VM. The `setup-oci-network` script creates the required
+IAM dynamic group and policy for this.
+
+---
+
+## Layering your own workload
+
+`payload/keepalive/` runs on every VM by default (user crontab, no sudo needed).
+To add your project:
+
+1. Create `payload/<your-project>/`
+2. Add an idempotent `install.sh`
+3. Call it from `fleet/<role>/setup.sh`, or run it via `ssh-vm` after the fleet is up
+
+See [payload/README.md](payload/README.md) for details.
+
+**Connecting a separate project:** once the fleet is running, hit `/export` in the
+admin console to get a block of env vars (public IPs, private IPs, SSH user). Paste
+those into your project's `.env`. The fleet keeps managing itself independently.
 
 ---
 
 ## Security model
 
-- `.env` is gitignored — never committed
-- `ADMIN_PASSWORD_HASH` is PBKDF2-hashed locally; the plaintext never reaches a VM
-- `vm-profiles/*.json` snapshots are gitignored (contain IP addresses)
-- VMs authenticate to OCI via instance-principal (no API key stored on any VM)
-- Admin console runs on `localhost:8765`, exposed to the internet only via Caddy
-- Caddy handles TLS termination with a real cert (Let's Encrypt via DuckDNS challenge)
-- Session cookie is `HttpOnly; SameSite=Strict` with a 7-day expiry
-- Login is rate-limited to 5 attempts per 15 minutes per IP
-- `GITHUB_TOKEN` in `.env` is a read-only PAT — it only needs `repo` (read) scope
+- `.env` is gitignored — never committed to your fork
+- Password hashing is PBKDF2-SHA256 (260,000 rounds), computed locally;
+  plaintext never leaves your machine
+- VMs authenticate to OCI via instance-principal — no API key on any VM
+- `vm-profiles/` state snapshots are gitignored (contain IP addresses)
+- Admin console binds to `localhost:8765`; Caddy handles TLS and public exposure
+- Session cookie is `HttpOnly; SameSite=Strict` with 7-day expiry
+- Login is rate-limited: 5 attempts per IP per 15 minutes
+- `GITHUB_TOKEN` needs only read (`repo`) scope — VMs never push anything
 
 ---
 
 ## Troubleshooting
 
-**Admin console not loading** — check Caddy: `sudo systemctl status caddy` on the
-management VM. If it just launched, wait 60 seconds for the DuckDNS TLS cert.
+**Admin console shows a TLS error on first load** — Caddy is still getting the
+Let's Encrypt cert. Wait 60 seconds and reload.
 
-**OCI CLI errors on management VM** — run `bootstrap-mgmt-vm` to re-apply setup.
+**Admin console not loading at all** — check Caddy on the management VM:
+```bash
+bash admin/ssh-vm.sh management
+sudo systemctl status caddy
+sudo journalctl -u caddy -n 50
+```
 
-**`check-all-vms` shows worker/lab-vm as NOT FOUND** — the orchestrator may still
-be on its first run. Check its log: `journalctl -u cloud-lab-orchestrator -f` on
-the management VM.
+**OCI CLI errors on the management VM** — run `bootstrap-mgmt-vm` to re-apply setup.
 
-**A1 Flex launch fails repeatedly** — normal. The orchestrator logs retries to
-`journalctl -u cloud-lab-orchestrator`. It will eventually succeed.
+**Worker or lab-vm stuck as NOT FOUND** — the orchestrator is working on it. Check:
+```bash
+bash admin/ssh-vm.sh management
+journalctl -u cloud-lab-orchestrator -f
+```
 
-**VM terminated unexpectedly** — Oracle reclaimed it. Check the orchestrator log;
-it should have already relaunched it. If not, run `bootstrap-mgmt-vm` to restart
-the orchestrator.
+**A1 Flex launch keeps failing** — completely normal. `Out of host capacity` is
+Oracle's queue, not an error you can fix. The orchestrator is retrying. Check progress
+in the orchestrator log above.
+
+**VM terminated unexpectedly** — Oracle reclaimed it (idle or capacity pressure). The
+orchestrator will relaunch it automatically. If the management VM was reclaimed, run
+`launch-management` again and then `bootstrap-mgmt-vm`.
+
+---
+
+## License
+
+MIT. See [LICENSE](LICENSE).

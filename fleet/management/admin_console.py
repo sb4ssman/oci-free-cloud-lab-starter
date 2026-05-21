@@ -8,7 +8,7 @@ Endpoints:
   GET  /login         Login form
   POST /login         Validate credentials, set session cookie, redirect to /
   GET  /logout        Clear session, redirect to /login
-  POST /heartbeat     Liveness pings from worker/lab-vm (no auth required)
+  POST /heartbeat     Liveness pings from worker/laboratory (no auth required)
   GET  /export        Fleet connection details for downstream projects (login required)
   GET  /stats?vm=<name>  Live system stats for any fleet VM (login required)
 """

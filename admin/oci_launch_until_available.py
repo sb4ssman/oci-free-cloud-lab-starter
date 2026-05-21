@@ -282,6 +282,18 @@ def build_user_data(config: dict[str, Any], env: dict[str, str]) -> str | None:
     env = dict(env)
     if "ADMIN_PASSWORD" in env and "ADMIN_PASSWORD_HASH" not in env:
         env["ADMIN_PASSWORD_HASH"] = _hash_password(env["ADMIN_PASSWORD"])
+    for optional_key in (
+        "DASHBOARD_DATABASE_URL",
+        "DASHBOARD_SCHWAB_APP_KEY",
+        "DASHBOARD_SCHWAB_APP_SECRET",
+        "DASHBOARD_SCHWAB_MARKET_APP_KEY",
+        "DASHBOARD_SCHWAB_MARKET_APP_SECRET",
+        "DASHBOARD_PLAID_CLIENT_ID",
+        "DASHBOARD_PLAID_SECRET",
+        "DASHBOARD_PLAID_ENV",
+        "DASHBOARD_COINGECKO_API_KEY",
+    ):
+        env.setdefault(optional_key, "")
 
     # Simple ${VAR} substitution from env. Unknown placeholders are left as-is.
     def replace(match: re.Match) -> str:

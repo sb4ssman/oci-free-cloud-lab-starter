@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
-# lab-vm role setup (the A1 Flex instance).
+# laboratory role setup (the A1 Flex instance).
 # Installs: heartbeat timer (→ management), crosswatch timer, self-update timer.
 # Safe to re-run.
 #
-# The lab-vm is your big compute canvas. Add your own workloads in payload/.
+# The laboratory is your big compute canvas. Add your own workloads in payload/.
 set -euo pipefail
 
 TOOLS_DIR="${TOOLS_DIR:-$HOME/cloud-lab}"
-ENV_FILE="${ENV_FILE:-$HOME/.config/cloud-lab/lab-vm.env}"
+ENV_FILE="${ENV_FILE:-$HOME/.config/cloud-lab/laboratory.env}"
 PYTHON="${PYTHON:-python3}"
 
-SRC="$TOOLS_DIR/fleet/lab-vm"
+SRC="$TOOLS_DIR/fleet/laboratory"
 
 # ── heartbeat timer (→ management console, every 4 h) ────────────────────────
 cat > /tmp/cloud-lab-heartbeat.service <<SERVICE
 [Unit]
-Description=Cloud Lab lab-vm heartbeat — POSTs liveness to management console
+Description=Cloud Lab laboratory heartbeat — POSTs liveness to management console
 
 [Service]
 User=ubuntu
@@ -28,7 +28,7 @@ SERVICE
 
 cat > /tmp/cloud-lab-heartbeat.timer <<TIMER
 [Unit]
-Description=Cloud Lab lab-vm heartbeat — every 4 hours
+Description=Cloud Lab laboratory heartbeat — every 4 hours
 
 [Timer]
 OnBootSec=5min
@@ -103,7 +103,7 @@ sudo systemctl enable cloud-lab-heartbeat.timer cloud-lab-crosswatch.timer cloud
 sudo systemctl start  cloud-lab-heartbeat.timer cloud-lab-crosswatch.timer cloud-lab-update.timer
 
 echo ""
-echo "lab-vm role installed."
+echo "laboratory role installed."
 echo "Timers: cloud-lab-heartbeat (4h -> management), cloud-lab-crosswatch (6h -> management), cloud-lab-update (nightly)"
 echo ""
 echo "Next: deploy your payload. See payload/README.md"

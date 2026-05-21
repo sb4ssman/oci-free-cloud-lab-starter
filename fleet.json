@@ -15,11 +15,11 @@
       "profile": "admin/profiles/worker.json"
     },
     {
-      "name": "lab-vm",
-      "role": "lab-vm",
+      "name": "laboratory",
+      "role": "laboratory",
       "shape": "VM.Standard.A1.Flex",
       "expected_state": "RUNNING",
-      "profile": "admin/profiles/lab-vm.json"
+      "profile": "admin/profiles/laboratory.json"
     }
   ]
 }

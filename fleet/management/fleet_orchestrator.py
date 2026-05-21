@@ -8,7 +8,7 @@ Single continuous loop:
        - If missing or TERMINATED: launch with cloud-init, verify SSH, ntfy
   2. Sleep and repeat (long interval once fleet is healthy).
 
-The lab-vm (A1 Flex) uses the hitrov-pattern retry: checks existing capacity
+The laboratory (A1 Flex) uses the hitrov-pattern retry: checks existing capacity
 before launching, catches "Out of host capacity" specifically, and retries until
 the lottery is won. Micro VMs launch immediately.
 """

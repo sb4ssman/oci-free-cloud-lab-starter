@@ -1,5 +1,5 @@
 {
-  "instance_display_name": "lab-vm",
+  "instance_display_name": "laboratory",
   "shape": "VM.Standard.A1.Flex",
   "ocpus": 4,
   "memory_in_gbs": 24,
@@ -30,5 +30,5 @@
     "env": "OCI_AVAILABILITY_DOMAIN",
     "default": ""
   },
-  "cloud_init_template": "fleet/lab-vm/cloud-init.sh"
+  "cloud_init_template": "fleet/laboratory/cloud-init.sh"
 }

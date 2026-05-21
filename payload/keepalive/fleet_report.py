@@ -22,7 +22,7 @@ TOOLS_DIR  = Path.home() / "cloud-lab"
 
 
 def find_env_file() -> Path | None:
-    for candidate in ["management.env", "worker.env", "lab-vm.env"]:
+    for candidate in ["management.env", "worker.env", "laboratory.env"]:
         p = CONFIG_DIR / candidate
         if p.exists():
             return p
@@ -72,6 +72,11 @@ def main() -> None:
 
     env = parse_env_file(env_file)
     env.update(os.environ)
+
+    vm_name = env.get("FLEET_VM_NAME", "unknown")
+    if vm_name != "management":
+        print(f"[fleet_report] {vm_name} is not management — skipping owner ntfy report.", flush=True)
+        return
 
     topic       = env.get("NOTIFY_NTFY_TOPIC", "")
     ntfy_server = env.get("NOTIFY_NTFY_SERVER", "https://ntfy.sh")

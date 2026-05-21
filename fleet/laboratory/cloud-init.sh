@@ -1,5 +1,5 @@
 #!/bin/bash
-# Cloud-init bootstrap for lab-vm (the A1 Flex instance).
+# Cloud-init bootstrap for laboratory (the A1 Flex instance).
 # Runs as root on first boot via OCI user-data.
 # ${VAR} placeholders are substituted by fleet_orchestrator.py at launch time.
 set -euo pipefail
@@ -19,7 +19,7 @@ sudo -u ubuntu git clone "$CLONE_URL" /home/ubuntu/cloud-lab \
   || sudo -u ubuntu git -C /home/ubuntu/cloud-lab pull --ff-only
 
 mkdir -p /home/ubuntu/.config/cloud-lab
-cat > /home/ubuntu/.config/cloud-lab/lab-vm.env << 'ENVEOF'
+cat > /home/ubuntu/.config/cloud-lab/laboratory.env << 'ENVEOF'
 OCI_AUTH_MODE=instance_principal
 OCI_COMPARTMENT_ID=${OCI_COMPARTMENT_ID}
 OCI_SUBNET_ID=${OCI_SUBNET_ID}
@@ -28,13 +28,13 @@ NOTIFY_NTFY_TOPIC=${NOTIFY_NTFY_TOPIC}
 GITHUB_TOKEN=${GITHUB_TOKEN}
 FLEET_REPO=${FLEET_REPO}
 FLEET_NAME=${FLEET_NAME}
-FLEET_VM_NAME=lab-vm
+FLEET_VM_NAME=laboratory
 ENVEOF
-chmod 600 /home/ubuntu/.config/cloud-lab/lab-vm.env
-chown ubuntu:ubuntu /home/ubuntu/.config/cloud-lab/lab-vm.env
+chmod 600 /home/ubuntu/.config/cloud-lab/laboratory.env
+chown ubuntu:ubuntu /home/ubuntu/.config/cloud-lab/laboratory.env
 
 sudo -u ubuntu \
     env TOOLS_DIR=/home/ubuntu/cloud-lab \
-    bash /home/ubuntu/cloud-lab/fleet/lab-vm/setup.sh
+    bash /home/ubuntu/cloud-lab/fleet/laboratory/setup.sh
 sudo -u ubuntu bash /home/ubuntu/cloud-lab/payload/keepalive/install.sh \
-    /home/ubuntu/.config/cloud-lab/lab-vm.env
+    /home/ubuntu/.config/cloud-lab/laboratory.env

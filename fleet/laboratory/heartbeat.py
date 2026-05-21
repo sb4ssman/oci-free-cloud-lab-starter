@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-lab-vm heartbeat — runs as a systemd timer.
+laboratory heartbeat — runs as a systemd timer.
 POSTs a liveness ping to the management admin console every 4 hours.
 """
 
@@ -13,7 +13,7 @@ import urllib.request
 from pathlib import Path
 
 
-ENV_FILE = Path.home() / ".config" / "cloud-lab" / "lab-vm.env"
+ENV_FILE = Path.home() / ".config" / "cloud-lab" / "laboratory.env"
 
 
 def parse_env_file(path: Path) -> dict[str, str]:
@@ -44,7 +44,7 @@ def main() -> None:
     env.update(os.environ)
 
     mgmt_ip = env.get("FLEET_MANAGEMENT_PRIVATE_IP", "")
-    vm_name = env.get("FLEET_VM_NAME", "lab-vm")
+    vm_name = env.get("FLEET_VM_NAME", "laboratory")
 
     if not mgmt_ip:
         print("[heartbeat] FLEET_MANAGEMENT_PRIVATE_IP not set — skipping.", flush=True)

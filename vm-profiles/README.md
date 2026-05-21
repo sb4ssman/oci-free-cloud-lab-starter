@@ -2,7 +2,7 @@
 
 Auto-generated OCI state snapshots. Written by `admin/check_oci_vm_status.py`.
 
-Each file (`management.json`, `worker.json`, `lab-vm.json`) is a JSON snapshot of
+Each file (`management.json`, `worker.json`, `laboratory.json`) is a JSON snapshot of
 the most recently observed OCI state for that VM: OCID, lifecycle state, public IP,
 private IP, shape, availability domain, and last-seen timestamp.
 

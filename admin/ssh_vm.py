@@ -5,10 +5,10 @@ SSH into a fleet VM by name.
 Usage:
   ssh-vm.bat management          open interactive shell
   ssh-vm.bat worker              open interactive shell
-  ssh-vm.bat lab-vm -- <cmd>     run one command and exit
+  ssh-vm.bat laboratory -- <cmd>     run one command and exit
 
 IP resolution order:
-  1. OCI_<NAME_SLUG>_HOST in .env  (e.g. OCI_MANAGEMENT_HOST, OCI_LAB_VM_HOST)
+  1. OCI_<NAME_SLUG>_HOST in .env  (e.g. OCI_MANAGEMENT_HOST, OCI_LABORATORY_HOST)
   2. public_ip in vm-profiles/<name>.json  (written by check-all-vms)
   3. Bail with instructions.
 """
@@ -48,7 +48,7 @@ def expand(value: str, env: dict[str, str]) -> str:
 
 
 def resolve_ip(name: str, env: dict[str, str]) -> str:
-    # management → OCI_MANAGEMENT_HOST, lab-vm → OCI_LAB_VM_HOST
+    # management → OCI_MANAGEMENT_HOST, laboratory → OCI_LABORATORY_HOST
     env_key = f"OCI_{name.upper().replace('-', '_')}_HOST"
     ip = env.get(env_key, "").strip()
     if ip:

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-lab-vm cross-watch — runs as a systemd timer.
+laboratory cross-watch — runs as a systemd timer.
 Checks OCI state of peer VMs every 6 hours.
 Reports anomalies to the management VM; management is the only ntfy speaker.
 """
@@ -16,7 +16,7 @@ from pathlib import Path
 
 
 TOOLS_DIR = Path(__file__).resolve().parent.parent.parent   # repo root
-ENV_FILE  = Path.home() / ".config" / "cloud-lab" / "lab-vm.env"
+ENV_FILE  = Path.home() / ".config" / "cloud-lab" / "laboratory.env"
 
 
 def parse_env_file(path: Path) -> dict[str, str]:
@@ -85,7 +85,7 @@ def main() -> None:
 
     compartment_id = env.get("OCI_COMPARTMENT_ID", "")
     mgmt_ip = env.get("FLEET_MANAGEMENT_PRIVATE_IP", "")
-    this_vm = env.get("FLEET_VM_NAME", "lab-vm")
+    this_vm = env.get("FLEET_VM_NAME", "laboratory")
 
     if not compartment_id:
         print("[crosswatch] OCI_COMPARTMENT_ID not set — skipping.", flush=True)

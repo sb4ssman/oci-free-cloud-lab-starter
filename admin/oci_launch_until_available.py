@@ -345,6 +345,28 @@ def launch_args(
     return args, temp_files
 
 
+def instance_already_active(config: dict[str, Any]) -> bool:
+    """Return True if an instance with this display name is already RUNNING or PROVISIONING."""
+    try:
+        data = run_oci_json(
+            ["compute", "instance", "list",
+             "--compartment-id", config["compartment_id"], "--all"],
+            auth_mode=config["oci_auth"],
+            timeout_seconds=int(config["oci_timeout_seconds"]),
+            heartbeat_seconds=int(config["oci_heartbeat_seconds"]),
+        )
+        for item in data.get("data", []):
+            if (item.get("display-name") == config["instance_display_name"] and
+                    item.get("lifecycle-state") not in ("TERMINATING", "TERMINATED")):
+                log(f"Pre-flight: '{config['instance_display_name']}' already exists "
+                    f"({item['lifecycle-state']}) — skipping launch.")
+                return True
+        return False
+    except Exception as exc:
+        log(f"Pre-flight check failed ({exc}); proceeding with launch attempt.")
+        return False
+
+
 def capacityish(text: str, timed_out: bool) -> bool:
     if timed_out:
         return True
@@ -443,6 +465,9 @@ def retry(config: dict[str, Any], env: dict[str, str]) -> int:
     log(f"Retry delay : {config['retry_delay_seconds']}s")
     if config.get("cloud_init_template"):
         log(f"Cloud-init  : {config['cloud_init_template']}")
+
+    if instance_already_active(config):
+        return 0
 
     ad = availability_domain(config)
     image_id = latest_image_id(config)

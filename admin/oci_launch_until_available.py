@@ -162,6 +162,8 @@ def run_oci(
 
     stdout, stderr = process.communicate()
     code = 124 if timed_out else int(process.returncode or 0)
+    if timed_out and not stderr:
+        stderr = f"Timed out after {timeout_seconds}s: oci {' '.join(args)}"
     return code, stdout or "", stderr or "", timed_out
 
 
@@ -360,23 +362,20 @@ def launch_args(
 
 def find_active_instance(config: dict[str, Any]) -> dict[str, Any] | None:
     """Return an existing non-terminated instance with this display name, if any."""
-    try:
-        data = run_oci_json(
-            ["compute", "instance", "list",
-             "--compartment-id", config["compartment_id"],
-             "--display-name", config["instance_display_name"]],
-            auth_mode=config["oci_auth"],
-            timeout_seconds=60,
-            heartbeat_seconds=0,
-        )
-        for item in data.get("data", []):
-            if (item.get("display-name") == config["instance_display_name"] and
-                    item.get("lifecycle-state") not in ("TERMINATING", "TERMINATED")):
-                return item
-        return None
-    except Exception as exc:
-        log(f"Pre-flight check failed ({exc}); proceeding with launch attempt.")
-        return None
+    timeout_seconds = max(180, int(config.get("oci_timeout_seconds", 60)))
+    data = run_oci_json(
+        ["compute", "instance", "list",
+         "--compartment-id", config["compartment_id"],
+         "--display-name", config["instance_display_name"]],
+        auth_mode=config["oci_auth"],
+        timeout_seconds=timeout_seconds,
+        heartbeat_seconds=int(config.get("oci_heartbeat_seconds", 15)),
+    )
+    for item in data.get("data", []):
+        if (item.get("display-name") == config["instance_display_name"] and
+                item.get("lifecycle-state") not in ("TERMINATING", "TERMINATED")):
+            return item
+    return None
 
 
 def instance_already_active(config: dict[str, Any]) -> bool:
@@ -393,7 +392,11 @@ def wait_for_active_instance(config: dict[str, Any], timeout_seconds: int = 600)
     """Poll OCI for a possibly-created instance after a client timeout or retryable error."""
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
-        item = find_active_instance(config)
+        try:
+            item = find_active_instance(config)
+        except Exception as exc:
+            log(f"Post-launch status check failed ({exc}); retrying before launching again.")
+            item = None
         if item:
             log(f"Found '{config['instance_display_name']}' in OCI "
                 f"({item.get('lifecycle-state', 'UNKNOWN')}) — stopping retry loop.")

@@ -36,6 +36,7 @@ PW_HASH    = os.getenv("ADMIN_PASSWORD_HASH", "")
 FLEET_NAME = os.getenv("FLEET_NAME", "Cloud Lab")
 TOOLS_DIR  = Path(os.getenv("CLOUD_LAB_DIR",
              str(Path.home() / "cloud-lab"))).expanduser()
+HEARTBEATS_FILE = TOOLS_DIR / "vm-profiles" / "_heartbeats.json"
 
 COOKIE_NAME      = "fleet_session"
 SESSION_DURATION = 7 * 24 * 3600   # 7 days
@@ -135,6 +136,19 @@ def load_json(path: Path):
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+
+
+def load_heartbeats() -> None:
+    data = load_json(HEARTBEATS_FILE)
+    if isinstance(data, dict):
+        with _hb_lock:
+            _heartbeats.update(data)
+
+
+def save_heartbeats() -> None:
+    HEARTBEATS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with _hb_lock:
+        HEARTBEATS_FILE.write_text(json.dumps(_heartbeats, indent=2), encoding="utf-8")
 
 
 def fmt_ago(iso: str) -> str:
@@ -593,12 +607,25 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 data = {}
             sender = str(data.get("vm_name", "unknown"))
+            now = datetime.now(timezone.utc).isoformat()
             with _hb_lock:
+                existing = _heartbeats.get(sender, {})
+                events = list(existing.get("events", []))
+                event = data.get("event")
+                if event:
+                    events.append({
+                        "received_at": now,
+                        "event": str(event),
+                        "details": data.get("details", {}),
+                    })
+                    events = events[-20:]
                 _heartbeats[sender] = {
-                    "received_at": datetime.now(timezone.utc).isoformat(),
+                    "received_at": now,
                     "uptime": str(data.get("uptime", "?")),
                     "extra": data,
+                    "events": events,
                 }
+            save_heartbeats()
             self._respond(200, b"ok")
 
         else:
@@ -620,6 +647,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    load_heartbeats()
     print(f"[admin_console] Listening on {HOST}:{PORT}", flush=True)
     print(f"[admin_console] Fleet: {FLEET_NAME}", flush=True)
     print(f"[admin_console] Tools dir: {TOOLS_DIR}", flush=True)

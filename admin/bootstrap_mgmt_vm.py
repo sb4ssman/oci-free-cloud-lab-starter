@@ -60,7 +60,6 @@ def build_script(env: dict[str, str]) -> str:
     compartment  = env.get("OCI_COMPARTMENT_ID", "")
     subnet       = env.get("OCI_SUBNET_ID", "")
     ntfy         = env.get("NOTIFY_NTFY_TOPIC", "")
-    mgmt_ip      = env.get("FLEET_MANAGEMENT_PRIVATE_IP", "10.0.0.2")
     admin_domain = env.get("ADMIN_DOMAIN", "")
     admin_user   = env.get("ADMIN_USERNAME", "admin")
     admin_pass   = env.get("ADMIN_PASSWORD", "")
@@ -120,6 +119,7 @@ echo "[bootstrap] Patching management config..."
 mkdir -p "$HOME/.config/cloud-lab"
 touch "$HOME/.config/cloud-lab/management.env"
 chmod 600 "$HOME/.config/cloud-lab/management.env"
+MGMT_PRIVATE_IP="$(hostname -I | awk '{{print $1}}')"
 
 # patch_key: add only if missing (preserves manual edits).
 patch_key() {{
@@ -141,17 +141,18 @@ force_key() {{
 patch_key OCI_AUTH_MODE                instance_principal
 patch_key OCI_COMPARTMENT_ID           {compartment}
 patch_key OCI_SUBNET_ID                {subnet}
-patch_key FLEET_MANAGEMENT_PRIVATE_IP  {mgmt_ip}
 patch_key NOTIFY_NTFY_TOPIC            {ntfy}
 patch_key GITHUB_TOKEN                 {token}
 patch_key FLEET_REPO                   {repo}
 patch_key FLEET_NAME                   {fleet_name}
 patch_key FLEET_VM_NAME                management
 patch_key ADMIN_DOMAIN                 {admin_domain}
+patch_key ADMIN_CONSOLE_HOST           0.0.0.0
 patch_key OCI_SSH_PUBLIC_KEY_PATH      "$HOME/.ssh/fleet.key.pub"
 patch_key OCI_SSH_PRIVATE_KEY_PATH     "$HOME/.ssh/fleet.key"
 patch_key OCI_SSH_USER                 ubuntu
 
+force_key FLEET_MANAGEMENT_PRIVATE_IP  "$MGMT_PRIVATE_IP"
 force_key ADMIN_USERNAME               {admin_user}
 force_key ADMIN_PASSWORD_HASH          {pw_hash}
 

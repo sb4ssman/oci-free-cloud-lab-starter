@@ -44,7 +44,7 @@ sudo mv /tmp/cloud-lab-heartbeat.timer   /etc/systemd/system/cloud-lab-heartbeat
 # ── cross-watch timer (every 6 h) ─────────────────────────────────────────────
 cat > /tmp/cloud-lab-crosswatch.service <<SERVICE
 [Unit]
-Description=Cloud Lab cross-watch — checks peer VMs, ntfy direct alert if down
+Description=Cloud Lab cross-watch — checks peer VMs, reports anomalies to management
 
 [Service]
 User=ubuntu
@@ -104,6 +104,6 @@ sudo systemctl start  cloud-lab-heartbeat.timer cloud-lab-crosswatch.timer cloud
 
 echo ""
 echo "lab-vm role installed."
-echo "Timers: cloud-lab-heartbeat (4h → management), cloud-lab-crosswatch (6h → ntfy), cloud-lab-update (nightly)"
+echo "Timers: cloud-lab-heartbeat (4h -> management), cloud-lab-crosswatch (6h -> management), cloud-lab-update (nightly)"
 echo ""
 echo "Next: deploy your payload. See payload/README.md"

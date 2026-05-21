@@ -102,4 +102,4 @@ sudo systemctl start  cloud-lab-heartbeat.timer cloud-lab-crosswatch.timer cloud
 
 echo ""
 echo "Worker role installed."
-echo "Timers: cloud-lab-heartbeat (4h → management), cloud-lab-crosswatch (6h → ntfy), cloud-lab-update (nightly)"
+echo "Timers: cloud-lab-heartbeat (4h -> management), cloud-lab-crosswatch (6h -> management), cloud-lab-update (nightly)"

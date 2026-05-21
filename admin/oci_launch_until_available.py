@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 import webbrowser
 from datetime import datetime
@@ -345,26 +346,125 @@ def launch_args(
     return args, temp_files
 
 
-def instance_already_active(config: dict[str, Any]) -> bool:
-    """Return True if an instance with this display name is already RUNNING or PROVISIONING."""
+def find_active_instance(config: dict[str, Any]) -> dict[str, Any] | None:
+    """Return an existing non-terminated instance with this display name, if any."""
     try:
         data = run_oci_json(
             ["compute", "instance", "list",
-             "--compartment-id", config["compartment_id"], "--all"],
+             "--compartment-id", config["compartment_id"],
+             "--display-name", config["instance_display_name"]],
             auth_mode=config["oci_auth"],
-            timeout_seconds=30,
+            timeout_seconds=60,
             heartbeat_seconds=0,
         )
         for item in data.get("data", []):
             if (item.get("display-name") == config["instance_display_name"] and
                     item.get("lifecycle-state") not in ("TERMINATING", "TERMINATED")):
-                log(f"Pre-flight: '{config['instance_display_name']}' already exists "
-                    f"({item['lifecycle-state']}) — skipping launch.")
-                return True
-        return False
+                return item
+        return None
     except Exception as exc:
         log(f"Pre-flight check failed ({exc}); proceeding with launch attempt.")
-        return False
+        return None
+
+
+def instance_already_active(config: dict[str, Any]) -> bool:
+    """Return True if an instance with this display name already exists."""
+    item = find_active_instance(config)
+    if item:
+        log(f"Pre-flight: '{config['instance_display_name']}' already exists "
+            f"({item.get('lifecycle-state', 'UNKNOWN')}) — skipping launch.")
+        return True
+    return False
+
+
+def wait_for_active_instance(config: dict[str, Any], timeout_seconds: int = 600) -> dict[str, Any] | None:
+    """Poll OCI for a possibly-created instance after a client timeout or retryable error."""
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        item = find_active_instance(config)
+        if item:
+            log(f"Found '{config['instance_display_name']}' in OCI "
+                f"({item.get('lifecycle-state', 'UNKNOWN')}) — stopping retry loop.")
+            return item
+        time.sleep(15)
+    return None
+
+
+def public_ip_for_instance(config: dict[str, Any], instance_id: str) -> str:
+    """Return the public IP for an instance, or an empty string if OCI has not attached it yet."""
+    attachments = run_oci_json(
+        ["compute", "vnic-attachment", "list",
+         "--compartment-id", config["compartment_id"],
+         "--instance-id", instance_id,
+         "--all"],
+        auth_mode=config["oci_auth"],
+        timeout_seconds=60,
+        heartbeat_seconds=0,
+    ).get("data", [])
+    for attachment in attachments:
+        vnic_id = attachment.get("vnic-id", "")
+        if not vnic_id:
+            continue
+        vnic = run_oci_json(
+            ["network", "vnic", "get", "--vnic-id", vnic_id],
+            auth_mode=config["oci_auth"],
+            timeout_seconds=60,
+            heartbeat_seconds=0,
+        ).get("data", {})
+        public_ip = vnic.get("public-ip") or ""
+        if public_ip:
+            return public_ip
+    return ""
+
+
+def wait_for_public_ip(config: dict[str, Any], instance_id: str, timeout_seconds: int = 300) -> str:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            public_ip = public_ip_for_instance(config, instance_id)
+            if public_ip:
+                log(f"Public IP   : {public_ip}")
+                return public_ip
+        except Exception as exc:
+            log(f"Public IP lookup failed ({exc}); retrying.")
+        time.sleep(10)
+    log("Public IP lookup timed out.")
+    return ""
+
+
+def update_duckdns(env: dict[str, str], public_ip: str) -> None:
+    """Update DuckDNS when ADMIN_DOMAIN and DUCKDNS_TOKEN are configured."""
+    domain = env.get("ADMIN_DOMAIN", "").strip()
+    token = env.get("DUCKDNS_TOKEN", "").strip()
+    if not domain or not token or not public_ip:
+        return
+
+    suffix = ".duckdns.org"
+    if not domain.lower().endswith(suffix):
+        log(f"ADMIN_DOMAIN is not a DuckDNS hostname ({domain}); skipping DuckDNS update.")
+        return
+
+    subdomain = domain[:-len(suffix)]
+    query = urllib.parse.urlencode({"domains": subdomain, "token": token, "ip": public_ip})
+    try:
+        with urllib.request.urlopen(f"https://www.duckdns.org/update?{query}", timeout=15) as response:
+            body = response.read().decode("utf-8", errors="replace").strip()
+        if body.upper() == "OK":
+            log(f"DuckDNS updated: {domain} -> {public_ip}")
+        else:
+            log(f"DuckDNS update returned {body!r} for {domain}.")
+    except Exception as exc:
+        log(f"DuckDNS update failed: {exc}")
+
+
+def finish_success(config: dict[str, Any], env: dict[str, str], instance_id: str, console_url: str) -> int:
+    public_ip = wait_for_public_ip(config, instance_id)
+    update_duckdns(env, public_ip)
+    admin_domain = env.get("ADMIN_DOMAIN", "").strip()
+    if admin_domain:
+        log(f"Admin URL   : https://{admin_domain}")
+    notify_success(config, env, console_url)
+    return 0
 
 
 def capacityish(text: str, timed_out: bool) -> bool:
@@ -373,7 +473,7 @@ def capacityish(text: str, timed_out: bool) -> bool:
     return bool(re.search(r"Out of host capacity|Out of capacity|InternalError|TooManyRequests|429|Timed out", text, re.I))
 
 
-def notify_success(config: dict[str, Any], console_url: str) -> None:
+def notify_success(config: dict[str, Any], env: dict[str, str], console_url: str) -> None:
     log("Oracle VM launch succeeded.")
     title = "Oracle VM launch succeeded"
     body = f"{config['instance_display_name']} is running. {console_url}"
@@ -467,6 +567,10 @@ def retry(config: dict[str, Any], env: dict[str, str]) -> int:
         log(f"Cloud-init  : {config['cloud_init_template']}")
 
     if instance_already_active(config):
+        item = find_active_instance(config)
+        if item and item.get("id"):
+            public_ip = wait_for_public_ip(config, item["id"], timeout_seconds=60)
+            update_duckdns(env, public_ip)
         return 0
 
     ad = availability_domain(config)
@@ -476,6 +580,17 @@ def retry(config: dict[str, Any], env: dict[str, str]) -> int:
 
     attempt = 0
     while True:
+        # Guard at top of every iteration: if a previous timed-out launch actually
+        # succeeded, OCI will show the instance as PROVISIONING/RUNNING here.
+        item = find_active_instance(config)
+        if item:
+            log(f"Pre-flight: '{config['instance_display_name']}' already exists "
+                f"({item.get('lifecycle-state', 'UNKNOWN')}) — skipping launch.")
+            if item.get("id"):
+                public_ip = wait_for_public_ip(config, item["id"], timeout_seconds=60)
+                update_duckdns(env, public_ip)
+            return 0
+
         attempt += 1
         temp_files: list[Path] = []
         log(f"Attempt #{attempt} - instance retry for {config['instance_display_name']}...")
@@ -494,11 +609,21 @@ def retry(config: dict[str, Any], env: dict[str, str]) -> int:
                 instance_id = data["data"]["id"]
                 console_url = f"https://cloud.oracle.com/compute/instances/{instance_id}"
                 log(f"ID          : {instance_id}")
-                notify_success(config, console_url)
-                return 0
+                return finish_success(config, env, instance_id, console_url)
 
             text = (stdout + " " + stderr).strip()
-            if capacityish(text, timed_out):
+            if timed_out:
+                log("Launch command timed out. Polling OCI before retrying...")
+                item = wait_for_active_instance(config)
+                if item and item.get("id"):
+                    console_url = f"https://cloud.oracle.com/compute/instances/{item['id']}"
+                    return finish_success(config, env, item["id"], console_url)
+                log(f"Instance not found after timeout. Will retry in {config['retry_delay_seconds']}s.")
+            elif capacityish(text, timed_out):
+                item = wait_for_active_instance(config, timeout_seconds=180)
+                if item and item.get("id"):
+                    console_url = f"https://cloud.oracle.com/compute/instances/{item['id']}"
+                    return finish_success(config, env, item["id"], console_url)
                 log(f"Capacity unavailable - will retry in {config['retry_delay_seconds']}s.")
             elif re.search(r"CannotParseRequest|InvalidParameter|InvalidRequest|NotAuthorizedOrNotFound", text):
                 log("Configuration/request error - not retrying until config or launch parameters are fixed.")

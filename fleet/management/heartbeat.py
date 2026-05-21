@@ -35,10 +35,18 @@ def parse_env_file(path: Path) -> dict[str, str]:
 def fleet_summary() -> str:
     fleet_file = TOOLS_DIR / "fleet.json"
     profile_dir = TOOLS_DIR / "vm-profiles"
+    heartbeat_file = profile_dir / "_heartbeats.json"
     if not fleet_file.exists():
         return "fleet.json not found"
 
     fleet = json.loads(fleet_file.read_text(encoding="utf-8"))
+    heartbeats = {}
+    if heartbeat_file.exists():
+        try:
+            heartbeats = json.loads(heartbeat_file.read_text(encoding="utf-8"))
+        except Exception:
+            heartbeats = {}
+
     lines = []
     for vm in fleet.get("vms", []):
         name = vm["name"]
@@ -50,8 +58,29 @@ def fleet_summary() -> str:
         else:
             state = "NO PROFILE"
             ip    = "?"
-        lines.append(f"{name}: {state} ({ip})")
+        hb = heartbeats.get(name, {})
+        hb_at = hb.get("received_at", "")
+        hb_text = f", heartbeat {fmt_ago(hb_at)}" if hb_at else ""
+        events = hb.get("events", [])
+        event_text = ""
+        if events:
+            last = events[-1]
+            event_text = f", last event {last.get('event', '?')} {fmt_ago(last.get('received_at', ''))}"
+        lines.append(f"{name}: {state} ({ip}){hb_text}{event_text}")
     return "\n".join(lines)
+
+
+def fmt_ago(iso: str) -> str:
+    try:
+        then = datetime.fromisoformat(iso)
+        delta = int((datetime.now(timezone.utc) - then).total_seconds())
+        if delta < 60:
+            return f"{delta}s ago"
+        if delta < 3600:
+            return f"{delta // 60}m ago"
+        return f"{delta // 3600}h ago"
+    except Exception:
+        return iso
 
 
 def main() -> None:

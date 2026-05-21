@@ -2,7 +2,7 @@
 """
 Worker cross-watch — runs as a systemd timer on the worker VM.
 Checks OCI state of peer VMs every 6 hours.
-Sends a direct ntfy alert if any expected-RUNNING VM is TERMINATED or missing.
+Reports anomalies to the management VM; management is the only ntfy speaker.
 """
 
 from __future__ import annotations
@@ -56,19 +56,27 @@ def oci_instance_states(compartment_id: str) -> dict[str, str]:
     }
 
 
-def ntfy_alert(topic: str, title: str, message: str, server: str = "https://ntfy.sh") -> None:
-    if not topic:
+def report_to_management(mgmt_ip: str, vm_name: str, event: str, details: dict) -> None:
+    if not mgmt_ip:
+        print("[crosswatch] FLEET_MANAGEMENT_PRIVATE_IP not set — cannot report event.", flush=True)
         return
+    payload = json.dumps({
+        "vm_name": vm_name,
+        "uptime": "crosswatch",
+        "event": event,
+        "details": details,
+    }).encode("utf-8")
+    url = f"http://{mgmt_ip}:8765/heartbeat"
     try:
         req = urllib.request.Request(
-            f"{server.rstrip('/')}/{topic}",
-            data=message.encode("utf-8"),
-            headers={"Title": title, "Tags": "warning,red_circle", "Priority": "high"},
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
             method="POST",
         )
         urllib.request.urlopen(req, timeout=10).read()
     except Exception as exc:
-        print(f"[crosswatch] ntfy failed: {exc}", flush=True)
+        print(f"[crosswatch] management report failed: {exc}", flush=True)
 
 
 def main() -> None:
@@ -76,10 +84,8 @@ def main() -> None:
     env.update(os.environ)
 
     compartment_id = env.get("OCI_COMPARTMENT_ID", "")
-    topic       = env.get("NOTIFY_NTFY_TOPIC", "")
-    ntfy_server = env.get("NOTIFY_NTFY_SERVER", "https://ntfy.sh")
-    fleet_name  = env.get("FLEET_NAME", "Cloud Lab")
-    this_vm     = env.get("FLEET_VM_NAME", "worker")
+    mgmt_ip = env.get("FLEET_MANAGEMENT_PRIVATE_IP", "")
+    this_vm = env.get("FLEET_VM_NAME", "worker")
 
     if not compartment_id:
         print("[crosswatch] OCI_COMPARTMENT_ID not set — skipping.", flush=True)
@@ -93,8 +99,7 @@ def main() -> None:
         states = oci_instance_states(compartment_id)
     except Exception as exc:
         print(f"[crosswatch] OCI query failed: {exc}", flush=True)
-        ntfy_alert(topic, f"{fleet_name} Cross-Watch Error",
-                   f"{this_vm} could not query OCI: {exc}", ntfy_server)
+        report_to_management(mgmt_ip, this_vm, "crosswatch_error", {"error": str(exc)})
         return
 
     for vm in fleet:
@@ -108,11 +113,11 @@ def main() -> None:
         print(f"[crosswatch] {name}: {state}", flush=True)
 
         if state not in ("RUNNING", "STARTING", "PROVISIONING"):
-            ntfy_alert(
-                topic,
-                f"{fleet_name} Alert: {name} is {state}",
-                f"{this_vm} cross-watch: {name} expected RUNNING but is {state}.",
-                ntfy_server,
+            report_to_management(
+                mgmt_ip,
+                this_vm,
+                "peer_unhealthy",
+                {"peer": name, "state": state, "expected": "RUNNING"},
             )
 
     print("[crosswatch] Done.", flush=True)

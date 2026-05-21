@@ -85,6 +85,70 @@ def find_existing(resource_list: list[dict], display_name: str) -> dict | None:
     return None
 
 
+def tcp_rule(source: str, port: int, description: str) -> dict:
+    return {
+        "protocol": "6",
+        "source": source,
+        "isStateless": False,
+        "tcpOptions": {"destinationPortRange": {"min": port, "max": port}},
+        "description": description,
+    }
+
+
+def has_tcp_rule(rules: list[dict], source: str, port: int) -> bool:
+    for rule in rules:
+        opts = rule.get("tcp-options") or rule.get("tcpOptions") or {}
+        port_range = opts.get("destination-port-range") or opts.get("destinationPortRange") or {}
+        if (rule.get("protocol") == "6" and
+                rule.get("source") == source and
+                int(port_range.get("min", -1)) <= port <= int(port_range.get("max", -1))):
+            return True
+    return False
+
+
+def normalize_security_rule(rule: dict) -> dict:
+    normalized = {
+        "protocol": rule.get("protocol"),
+        "source": rule.get("source"),
+        "isStateless": rule.get("isStateless", rule.get("is-stateless", False)),
+        "description": rule.get("description", ""),
+    }
+    tcp_options = rule.get("tcpOptions") or rule.get("tcp-options")
+    if tcp_options:
+        port_range = tcp_options.get("destinationPortRange") or tcp_options.get("destination-port-range")
+        if port_range:
+            normalized["tcpOptions"] = {
+                "destinationPortRange": {
+                    "min": port_range.get("min"),
+                    "max": port_range.get("max"),
+                }
+            }
+    icmp_options = rule.get("icmpOptions") or rule.get("icmp-options")
+    if icmp_options:
+        normalized["icmpOptions"] = dict(icmp_options)
+    return {k: v for k, v in normalized.items() if v not in (None, "")}
+
+
+def ensure_security_list_rules(sl_id: str, ingress_rules: list[dict], egress_rules: list[dict], dry_run: bool) -> None:
+    ingress_rules = [normalize_security_rule(rule) for rule in ingress_rules]
+    egress_rules = [normalize_security_rule(rule) for rule in egress_rules]
+    changed = False
+    if not has_tcp_rule(ingress_rules, VCN_CIDR, 8765):
+        print("  Adding management heartbeat/admin-console port 8765 from VCN CIDR...")
+        ingress_rules.append(tcp_rule(VCN_CIDR, 8765, "Management heartbeat/admin console from fleet VCN"))
+        changed = True
+
+    if changed:
+        run_oci([
+            "network", "security-list", "update",
+            "--security-list-id", sl_id,
+            "--ingress-security-rules", json.dumps(ingress_rules),
+            "--egress-security-rules", json.dumps(egress_rules),
+            "--force",
+        ], dry_run)
+        print("  Security List updated.")
+
+
 def main() -> int:
     dry_run = "--dry-run" in sys.argv
 
@@ -179,24 +243,19 @@ def main() -> int:
     if existing_sl:
         sl_id = existing_sl["id"]
         print(f"  Found existing Security List: {sl_id}")
+        ensure_security_list_rules(
+            sl_id,
+            existing_sl.get("ingress-security-rules", []),
+            existing_sl.get("egress-security-rules", []),
+            dry_run,
+        )
     else:
         print(f"  Creating Security List '{SL_NAME}'...")
         ingress_rules = json.dumps([
-            {   # SSH
-                "protocol": "6", "source": "0.0.0.0/0", "isStateless": False,
-                "tcpOptions": {"destinationPortRange": {"min": 22, "max": 22}},
-                "description": "SSH",
-            },
-            {   # HTTP (Caddy ACME challenge + redirect)
-                "protocol": "6", "source": "0.0.0.0/0", "isStateless": False,
-                "tcpOptions": {"destinationPortRange": {"min": 80, "max": 80}},
-                "description": "HTTP",
-            },
-            {   # HTTPS
-                "protocol": "6", "source": "0.0.0.0/0", "isStateless": False,
-                "tcpOptions": {"destinationPortRange": {"min": 443, "max": 443}},
-                "description": "HTTPS",
-            },
+            tcp_rule("0.0.0.0/0", 22, "SSH"),
+            tcp_rule("0.0.0.0/0", 80, "HTTP"),
+            tcp_rule("0.0.0.0/0", 443, "HTTPS"),
+            tcp_rule(VCN_CIDR, 8765, "Management heartbeat/admin console from fleet VCN"),
             {   # ICMP ping
                 "protocol": "1", "source": "0.0.0.0/0", "isStateless": False,
                 "icmpOptions": {"type": 8},

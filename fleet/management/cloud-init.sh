@@ -48,24 +48,27 @@ fi
 
 echo "[cloud-init] Writing management.env..."
 mkdir -p /home/ubuntu/.config/cloud-lab
+MANAGEMENT_PRIVATE_IP="$(hostname -I | awk '{print $1}')"
 # Single-quoted heredoc: bash won't re-expand values that Python already substituted.
 cat > /home/ubuntu/.config/cloud-lab/management.env << 'ENVEOF'
 OCI_AUTH_MODE=instance_principal
 OCI_COMPARTMENT_ID=${OCI_COMPARTMENT_ID}
 OCI_SUBNET_ID=${OCI_SUBNET_ID}
-FLEET_MANAGEMENT_PRIVATE_IP=${FLEET_MANAGEMENT_PRIVATE_IP}
+FLEET_MANAGEMENT_PRIVATE_IP=__MANAGEMENT_PRIVATE_IP__
 NOTIFY_NTFY_TOPIC=${NOTIFY_NTFY_TOPIC}
 GITHUB_TOKEN=${GITHUB_TOKEN}
 FLEET_REPO=${FLEET_REPO}
 FLEET_NAME=${FLEET_NAME}
 FLEET_VM_NAME=management
 ADMIN_DOMAIN=${ADMIN_DOMAIN}
+ADMIN_CONSOLE_HOST=0.0.0.0
 ADMIN_USERNAME=${ADMIN_USERNAME}
 ADMIN_PASSWORD_HASH=${ADMIN_PASSWORD_HASH}
 OCI_SSH_PUBLIC_KEY_PATH=/home/ubuntu/.ssh/fleet.key.pub
 OCI_SSH_PRIVATE_KEY_PATH=/home/ubuntu/.ssh/fleet.key
 OCI_SSH_USER=ubuntu
 ENVEOF
+sed -i "s/__MANAGEMENT_PRIVATE_IP__/${MANAGEMENT_PRIVATE_IP}/g" /home/ubuntu/.config/cloud-lab/management.env
 chmod 600 /home/ubuntu/.config/cloud-lab/management.env
 chown ubuntu:ubuntu /home/ubuntu/.config/cloud-lab/management.env
 

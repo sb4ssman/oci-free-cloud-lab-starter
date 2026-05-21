@@ -387,15 +387,13 @@ def launch_args(
 
     user_data_script = build_user_data(config, env)
     if user_data_script:
-        import base64
-        encoded = base64.b64encode(user_data_script.encode("utf-8")).decode("ascii")
-        handle = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8")
+        handle = tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False, encoding="utf-8", newline="\n")
         with handle:
-            handle.write(encoded)
+            handle.write(user_data_script)
         ud_path = Path(handle.name)
         temp_files.append(ud_path)
         args.extend(["--user-data-file", str(ud_path)])
-        log("Cloud-init user-data attached.")
+        log("Cloud-init user-data attached as raw shell script.")
 
     return args, temp_files
 

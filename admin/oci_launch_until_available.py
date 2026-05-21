@@ -363,6 +363,8 @@ def launch_args(
 def find_active_instance(config: dict[str, Any]) -> dict[str, Any] | None:
     """Return an existing non-terminated instance with this display name, if any."""
     timeout_seconds = max(180, int(config.get("oci_timeout_seconds", 60)))
+    log(f"Pre-flight: checking OCI for existing '{config['instance_display_name']}' "
+        f"(timeout {timeout_seconds}s).")
     data = run_oci_json(
         ["compute", "instance", "list",
          "--compartment-id", config["compartment_id"],
@@ -569,7 +571,7 @@ def retry(config: dict[str, Any], env: dict[str, str]) -> int:
     config["ssh_public_key_path"] = str(ssh_key)
     validate_ssh_key(ssh_key)
 
-    log("=== Oracle Retry Starting ===")
+    log(f"=== OCI VM Launch Starting: {config['instance_display_name']} ===")
     log(f"Auth        : {config['oci_auth']}")
     log(f"Compartment : {config['compartment_id']}")
     log(f"Subnet      : {config['subnet_id']}")
@@ -608,7 +610,7 @@ def retry(config: dict[str, Any], env: dict[str, str]) -> int:
 
         attempt += 1
         temp_files: list[Path] = []
-        log(f"Attempt #{attempt} - instance retry for {config['instance_display_name']}...")
+        log(f"Attempt #{attempt} - sending OCI launch request for {config['instance_display_name']}...")
         try:
             args, temp_files = launch_args(config, image_id, ad, env)
             code, stdout, stderr, timed_out = run_oci(

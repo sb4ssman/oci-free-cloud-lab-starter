@@ -279,8 +279,8 @@ def check_and_repair_fleet(fleet: list[dict[str, Any]], env: dict[str, str]) -> 
             all_healthy = False
             continue
 
-        if state == "RUNNING":
-            log(f"{name} is RUNNING — ok.")
+        if state in ("RUNNING", "PROVISIONING", "STARTING"):
+            log(f"{name} is {state} — ok.")
             continue
 
         log(f"{name} state={state or 'NOT FOUND'} — need to launch.")

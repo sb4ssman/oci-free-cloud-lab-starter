@@ -36,5 +36,5 @@ chown ubuntu:ubuntu /home/ubuntu/.config/cloud-lab/laboratory.env
 sudo -u ubuntu \
     env TOOLS_DIR=/home/ubuntu/cloud-lab \
     bash /home/ubuntu/cloud-lab/fleet/laboratory/setup.sh
-sudo -u ubuntu bash /home/ubuntu/cloud-lab/payload/keepalive/install.sh \
+sudo -H -u ubuntu bash /home/ubuntu/cloud-lab/payload/keepalive/install.sh \
     /home/ubuntu/.config/cloud-lab/laboratory.env

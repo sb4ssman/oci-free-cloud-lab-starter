@@ -114,6 +114,7 @@ def oci_env(auth_mode: str) -> dict[str, str]:
     else:
         raise RetryError("oci_auth must be 'api_key' or 'instance_principal'")
 
+    child_env["PYTHONWARNINGS"] = "ignore::FutureWarning"
     return child_env
 
 

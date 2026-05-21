@@ -20,6 +20,7 @@ import html
 import json
 import os
 import secrets
+import shutil
 import subprocess
 import threading
 import time
@@ -36,6 +37,7 @@ PW_HASH    = os.getenv("ADMIN_PASSWORD_HASH", "")
 FLEET_NAME = os.getenv("FLEET_NAME", "Cloud Lab")
 TOOLS_DIR  = Path(os.getenv("CLOUD_LAB_DIR",
              str(Path.home() / "cloud-lab"))).expanduser()
+PROFILE_DIR = TOOLS_DIR / "vm-profiles"
 HEARTBEATS_FILE = TOOLS_DIR / "vm-profiles" / "_heartbeats.json"
 
 COOKIE_NAME      = "fleet_session"
@@ -166,6 +168,98 @@ def fmt_ago(iso: str) -> str:
         return iso
 
 
+def oci_cmd(args: list[str], timeout: int = 60) -> dict:
+    oci = shutil.which("oci") or "/home/ubuntu/bin/oci"
+    child_env = os.environ.copy()
+    child_env["OCI_CLI_AUTH"] = "instance_principal"
+    child_env["OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING"] = "True"
+    child_env["PYTHONWARNINGS"] = "ignore::FutureWarning"
+    result = subprocess.run(
+        [oci, *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=child_env,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        raise RuntimeError((result.stdout + " " + result.stderr).strip())
+    if not result.stdout.strip():
+        return {"data": []}
+    return json.loads(result.stdout)
+
+
+def get_vnic_ips(instance_id: str, compartment_id: str) -> tuple[str, str]:
+    attachments = oci_cmd(
+        ["compute", "vnic-attachment", "list",
+         "--compartment-id", compartment_id,
+         "--instance-id", instance_id,
+         "--all"]
+    ).get("data", [])
+    active = [
+        item for item in attachments
+        if item.get("lifecycle-state") not in ("DETACHING", "DETACHED")
+    ]
+    if not active:
+        return "", ""
+    vnic_id = active[0].get("vnic-id", "")
+    if not vnic_id:
+        return "", ""
+    vnic = oci_cmd(["network", "vnic", "get", "--vnic-id", vnic_id]).get("data", {})
+    return vnic.get("public-ip") or "", vnic.get("private-ip") or ""
+
+
+def refresh_oci_snapshots() -> None:
+    """Refresh vm-profiles from OCI on the management VM itself."""
+    env = _mgmt_env()
+    compartment_id = env.get("OCI_COMPARTMENT_ID", "")
+    if not compartment_id:
+        return
+
+    fleet = load_json(TOOLS_DIR / "fleet.json") or {"vms": []}
+    wanted = {vm.get("name") for vm in fleet.get("vms", []) if vm.get("name")}
+    if not wanted:
+        return
+
+    try:
+        instances = oci_cmd(
+            ["compute", "instance", "list",
+             "--compartment-id", compartment_id,
+             "--all"],
+            timeout=90,
+        ).get("data", [])
+    except Exception as exc:
+        print(f"[admin_console] OCI refresh failed: {exc}", flush=True)
+        return
+
+    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc).isoformat()
+    for item in instances:
+        name = item.get("display-name", "")
+        state = item.get("lifecycle-state", "")
+        if name not in wanted or state in ("TERMINATING", "TERMINATED"):
+            continue
+        public_ip = ""
+        private_ip = ""
+        try:
+            public_ip, private_ip = get_vnic_ips(item["id"], compartment_id)
+        except Exception as exc:
+            print(f"[admin_console] VNIC refresh failed for {name}: {exc}", flush=True)
+        snapshot = {
+            "synced_at": now,
+            "public_ip": public_ip,
+            "private_ip": private_ip,
+            "instance": item,
+            "probe": {},
+        }
+        (PROFILE_DIR / f"{name}.json").write_text(
+            json.dumps(snapshot, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+
 # ── live stats ────────────────────────────────────────────────────────────────
 
 def _mgmt_env() -> dict[str, str]:
@@ -206,6 +300,7 @@ def collect_local_stats() -> str:
 
 
 def collect_remote_stats(vm_name: str) -> str:
+    refresh_oci_snapshots()
     env = _mgmt_env()
     ssh_key  = env.get("OCI_SSH_PRIVATE_KEY_PATH", str(Path.home() / ".ssh" / "fleet.key"))
     ssh_user = env.get("OCI_SSH_USER", "ubuntu")
@@ -325,15 +420,15 @@ COMMON_CSS = """
 
 
 def vm_cards() -> str:
+    refresh_oci_snapshots()
     fleet = load_json(TOOLS_DIR / "fleet.json") or {"vms": []}
-    profile_dir = TOOLS_DIR / "vm-profiles"
     with _hb_lock:
         hbs = dict(_heartbeats)
 
     cards = []
     for vm in fleet.get("vms", []):
         name       = vm.get("name", "")
-        profile    = load_json(profile_dir / f"{name}.json") or {}
+        profile    = load_json(PROFILE_DIR / f"{name}.json") or {}
         instance   = profile.get("instance", {})
         state      = instance.get("lifecycle-state", "UNKNOWN")
         public_ip  = profile.get("public_ip", "—")
@@ -423,15 +518,15 @@ def fleet_page() -> bytes:
 
 def export_page() -> bytes:
     """Fleet connection details — copy these into your downstream project's .env."""
+    refresh_oci_snapshots()
     fleet = load_json(TOOLS_DIR / "fleet.json") or {"vms": []}
-    profile_dir = TOOLS_DIR / "vm-profiles"
     fleet_name = html.escape(FLEET_NAME)
 
     lines = [f"# Fleet connection details — generated by {FLEET_NAME} management console",
              f"# Copy relevant values into your project's .env\n"]
     for vm in fleet.get("vms", []):
         name = vm.get("name", "")
-        profile = load_json(profile_dir / f"{name}.json") or {}
+        profile = load_json(PROFILE_DIR / f"{name}.json") or {}
         pub = profile.get("public_ip", "")
         priv = profile.get("private_ip", "")
         role = vm.get("role", "")

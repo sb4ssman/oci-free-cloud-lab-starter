@@ -18,6 +18,12 @@ CLONE_URL="https://oauth2:${GITHUB_TOKEN}@github.com/${FLEET_REPO}.git"
 sudo -u ubuntu git clone "$CLONE_URL" /home/ubuntu/cloud-lab \
   || sudo -u ubuntu git -C /home/ubuntu/cloud-lab pull --ff-only
 
+echo "[cloud-init] Generating fleet SSH keypair..."
+if [ ! -f /home/ubuntu/.ssh/fleet.key ]; then
+    sudo -u ubuntu ssh-keygen -t ed25519 \
+        -f /home/ubuntu/.ssh/fleet.key -N "" -C "${FLEET_NAME}-worker-fleet"
+fi
+
 mkdir -p /home/ubuntu/.config/cloud-lab
 cat > /home/ubuntu/.config/cloud-lab/worker.env << 'ENVEOF'
 OCI_AUTH_MODE=instance_principal
@@ -29,6 +35,9 @@ GITHUB_TOKEN=${GITHUB_TOKEN}
 FLEET_REPO=${FLEET_REPO}
 FLEET_NAME=${FLEET_NAME}
 FLEET_VM_NAME=worker
+OCI_SSH_PUBLIC_KEY_PATH=/home/ubuntu/.ssh/fleet.key.pub
+OCI_SSH_PRIVATE_KEY_PATH=/home/ubuntu/.ssh/fleet.key
+OCI_SSH_USER=ubuntu
 ENVEOF
 chmod 600 /home/ubuntu/.config/cloud-lab/worker.env
 chown ubuntu:ubuntu /home/ubuntu/.config/cloud-lab/worker.env
@@ -36,5 +45,6 @@ chown ubuntu:ubuntu /home/ubuntu/.config/cloud-lab/worker.env
 sudo -u ubuntu \
     env TOOLS_DIR=/home/ubuntu/cloud-lab \
     bash /home/ubuntu/cloud-lab/fleet/worker/setup.sh
-sudo -u ubuntu bash /home/ubuntu/cloud-lab/payload/keepalive/install.sh \
+
+sudo -H -u ubuntu bash /home/ubuntu/cloud-lab/payload/keepalive/install.sh \
     /home/ubuntu/.config/cloud-lab/worker.env

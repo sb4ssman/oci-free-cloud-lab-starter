@@ -11,7 +11,7 @@ apt-get update -qq
 apt-get install -y -qq \
     ca-certificates curl git jq python3 python3-venv tmux unzip \
     debian-keyring debian-archive-keyring apt-transport-https \
-    iptables-persistent
+    iptables-persistent dnsutils
 
 echo "[cloud-init] Installing OCI CLI..."
 if [ ! -f /home/ubuntu/bin/oci ]; then
@@ -32,6 +32,7 @@ fi
 echo "[cloud-init] Opening ports 80/443 in iptables..."
 iptables -C INPUT -p tcp --dport 80  -j ACCEPT 2>/dev/null || iptables -I INPUT 5 -p tcp --dport 80  -j ACCEPT
 iptables -C INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null || iptables -I INPUT 5 -p tcp --dport 443 -j ACCEPT
+iptables -C INPUT -p tcp -s 10.0.0.0/16 --dport 8765 -j ACCEPT 2>/dev/null || iptables -I INPUT 5 -p tcp -s 10.0.0.0/16 --dport 8765 -j ACCEPT
 netfilter-persistent save
 
 echo "[cloud-init] Cloning fleet repo..."
@@ -90,7 +91,7 @@ echo "[cloud-init] Setting hostname..."
 hostnamectl set-hostname management
 
 echo "[cloud-init] Installing keepalive payload..."
-sudo -u ubuntu bash /home/ubuntu/cloud-lab/payload/keepalive/install.sh \
+sudo -H -u ubuntu bash /home/ubuntu/cloud-lab/payload/keepalive/install.sh \
     /home/ubuntu/.config/cloud-lab/management.env
 
 echo ""

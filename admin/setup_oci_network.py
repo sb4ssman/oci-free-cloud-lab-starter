@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-One-time OCI network setup for the oracle-tools fleet.
+One-time OCI network/IAM setup for the cloud-lab fleet.
 
 Creates the VCN, internet gateway, public subnet, route table,
-and security list needed before any VMs can be launched.
+security list, and instance-principal IAM policy needed before
+the management VM can orchestrate the rest of the fleet.
 
 Safe to re-run — skips resources that already exist.
 Prints the values you need to add to oracle-tools/.env when done.
@@ -11,6 +12,7 @@ Prints the values you need to add to oracle-tools/.env when done.
 Usage:
   setup-oci-network.bat
   setup-oci-network.bat --dry-run   Show what would be created; don't create anything
+  setup-oci-network.bat --iam-only  Only create/update instance-principal IAM
 """
 
 from __future__ import annotations
@@ -33,6 +35,8 @@ SUBNET_NAME = "oracle-fleet-subnet-public"
 IGW_NAME    = "oracle-fleet-igw"
 SL_NAME     = "oracle-fleet-seclist"
 RT_NAME     = "oracle-fleet-routetable"
+DG_NAME     = "oracle-fleet-instances"
+POLICY_NAME = "oracle-fleet-instance-principal-policy"
 
 
 def parse_env(path: Path) -> dict[str, str]:
@@ -81,6 +85,13 @@ def run_oci(args: list[str], dry_run: bool = False) -> dict:
 def find_existing(resource_list: list[dict], display_name: str) -> dict | None:
     for item in resource_list:
         if item.get("display-name") == display_name and item.get("lifecycle-state") != "TERMINATED":
+            return item
+    return None
+
+
+def find_by_name(resource_list: list[dict], name: str) -> dict | None:
+    for item in resource_list:
+        if item.get("name") == name and item.get("lifecycle-state") not in ("DELETING", "DELETED"):
             return item
     return None
 
@@ -149,8 +160,83 @@ def ensure_security_list_rules(sl_id: str, ingress_rules: list[dict], egress_rul
         print("  Security List updated.")
 
 
+def tenancy_id_from_env(env: dict[str, str], compartment_id: str) -> str:
+    tenancy_id = (
+        env.get("OCI_TENANCY_ID", "")
+        or env.get("OCI_TENANCY_OCID", "")
+        or env.get("OCI_TENANCY", "")
+    ).strip()
+    if tenancy_id:
+        return tenancy_id
+    if compartment_id.startswith("ocid1.tenancy."):
+        return compartment_id
+    return ""
+
+
+def ensure_instance_principal_iam(tenancy_id: str, compartment_id: str, dry_run: bool) -> None:
+    if not tenancy_id:
+        print("  Skipping IAM setup: set OCI_TENANCY_ID when OCI_COMPARTMENT_ID is a child compartment.")
+        return
+
+    matching_rule = f"ALL {{instance.compartment.id = '{compartment_id}'}}"
+    statements = json.dumps([
+        f"Allow dynamic-group {DG_NAME} to manage all-resources in compartment id {compartment_id}"
+    ])
+
+    print("Checking instance-principal dynamic group...")
+    dg_list = run_oci(["iam", "dynamic-group", "list",
+                       "--compartment-id", tenancy_id, "--all"], dry_run)
+    existing_dg = find_by_name(dg_list.get("data", []), DG_NAME)
+    if existing_dg:
+        dg_id = existing_dg["id"]
+        print(f"  Found existing dynamic group: {dg_id}")
+        if existing_dg.get("matching-rule") != matching_rule:
+            print("  Updating dynamic group matching rule...")
+            run_oci(["iam", "dynamic-group", "update",
+                     "--dynamic-group-id", dg_id,
+                     "--matching-rule", matching_rule,
+                     "--force"], dry_run)
+    else:
+        print(f"  Creating dynamic group '{DG_NAME}'...")
+        result = run_oci([
+            "iam", "dynamic-group", "create",
+            "--compartment-id", tenancy_id,
+            "--name", DG_NAME,
+            "--description", "Cloud Lab fleet VM instance principals",
+            "--matching-rule", matching_rule,
+        ], dry_run)
+        dg_id = (result.get("data") or {}).get("id", "DRY_RUN_DYNAMIC_GROUP_OCID")
+        print(f"  Created dynamic group: {dg_id}")
+
+    print("Checking instance-principal policy...")
+    policy_list = run_oci(["iam", "policy", "list",
+                           "--compartment-id", tenancy_id, "--all"], dry_run)
+    existing_policy = find_by_name(policy_list.get("data", []), POLICY_NAME)
+    if existing_policy:
+        policy_id = existing_policy["id"]
+        print(f"  Found existing policy: {policy_id}")
+        if existing_policy.get("statements") != json.loads(statements):
+            print("  Updating policy statements...")
+            run_oci(["iam", "policy", "update",
+                     "--policy-id", policy_id,
+                     "--statements", statements,
+                     "--force"], dry_run)
+    else:
+        print(f"  Creating policy '{POLICY_NAME}'...")
+        result = run_oci([
+            "iam", "policy", "create",
+            "--compartment-id", tenancy_id,
+            "--name", POLICY_NAME,
+            "--description", "Allow Cloud Lab fleet instances to manage lab resources",
+            "--statements", statements,
+        ], dry_run)
+        policy_id = (result.get("data") or {}).get("id", "DRY_RUN_POLICY_OCID")
+        print(f"  Created policy: {policy_id}")
+
+
 def main() -> int:
     dry_run = "--dry-run" in sys.argv
+    iam_only = "--iam-only" in sys.argv
 
     env = parse_env(ENV_FILE)
     env.update(os.environ)
@@ -164,6 +250,12 @@ def main() -> int:
         print("-- DRY RUN -- nothing will be created --\n")
 
     print(f"Compartment: {compartment_id}\n")
+    tenancy_id = tenancy_id_from_env(env, compartment_id)
+
+    if iam_only:
+        ensure_instance_principal_iam(tenancy_id, compartment_id, dry_run)
+        print("\nIAM setup complete. It can take about 10-60 seconds for OCI policy changes to propagate.")
+        return 0
 
     # ── 1. VCN ────────────────────────────────────────────────────────────────
     print("Checking VCN...")
@@ -313,6 +405,10 @@ def main() -> int:
     print(f"  Availability domain: {ad}")
     if len(ads) > 1:
         print(f"  (All ADs: {', '.join(ads)} — using first)")
+
+    # ── 7. Instance-principal IAM ────────────────────────────────────────────
+    print()
+    ensure_instance_principal_iam(tenancy_id, compartment_id, dry_run)
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print("\n" + "─" * 60)

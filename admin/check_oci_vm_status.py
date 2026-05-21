@@ -63,6 +63,7 @@ def expand_path(value: str) -> Path:
 def oci_env(auth_mode: str) -> dict[str, str]:
     env = os.environ.copy()
     env["OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING"] = "True"
+    env["PYTHONWARNINGS"] = "ignore::FutureWarning"
     if auth_mode == "instance_principal":
         env["OCI_CLI_AUTH"] = "instance_principal"
     elif auth_mode == "api_key":
@@ -92,6 +93,8 @@ def run_oci(args: list[str], auth_mode: str) -> Any:
     )
     if result.returncode != 0:
         raise StatusError((result.stdout + " " + result.stderr).strip())
+    if not result.stdout.strip():
+        return {"data": []}
     return json.loads(result.stdout)
 
 
@@ -116,20 +119,27 @@ def slugify(value: str) -> str:
     return slug or "unnamed"
 
 
-def get_vnic_ips(instance_id: str, compartment_id: str, auth_mode: str) -> tuple[str, str]:
-    attachments = run_oci(
-        ["compute", "vnic-attachment", "list",
-         "--compartment-id", compartment_id,
-         "--instance-id", instance_id, "--all"],
-        auth_mode,
-    ).get("data", [])
-    if not attachments:
-        return "", ""
-    vnic_id = attachments[0].get("vnic-id")
-    if not vnic_id:
-        return "", ""
-    vnic = run_oci(["network", "vnic", "get", "--vnic-id", vnic_id], auth_mode).get("data", {})
-    return vnic.get("public-ip") or "", vnic.get("private-ip") or ""
+def get_vnic_ips(instance_id: str, compartment_id: str, auth_mode: str) -> tuple[str, str, str]:
+    try:
+        attachments = run_oci(
+            ["compute", "vnic-attachment", "list",
+             "--compartment-id", compartment_id,
+             "--instance-id", instance_id, "--all"],
+            auth_mode,
+        ).get("data", [])
+        active = [
+            item for item in attachments
+            if item.get("lifecycle-state") not in ("DETACHING", "DETACHED")
+        ]
+        if not active:
+            return "", "", ""
+        vnic_id = active[0].get("vnic-id")
+        if not vnic_id:
+            return "", "", ""
+        vnic = run_oci(["network", "vnic", "get", "--vnic-id", vnic_id], auth_mode).get("data", {})
+        return vnic.get("public-ip") or "", vnic.get("private-ip") or "", ""
+    except Exception as exc:
+        return "", "", f"vnic lookup failed: {exc}"
 
 
 def run_ssh(host: str, user: str, key_path: Path, command: str, timeout: int = 12) -> str:
@@ -264,7 +274,10 @@ def main() -> int:
         raise StatusError("OCI_COMPARTMENT_ID is missing from .env")
 
     data = run_oci(["compute", "instance", "list", "--compartment-id", compartment_id, "--all"], auth_mode)
-    instances = data.get("data", [])
+    instances = [
+        item for item in data.get("data", [])
+        if item.get("lifecycle-state") not in ("TERMINATING", "TERMINATED")
+    ]
 
     if args.id:
         instances = [item for item in instances if item.get("id") == args.id]
@@ -280,7 +293,7 @@ def main() -> int:
     print("-" * 116)
     for item in sorted(instances, key=lambda row: row.get("display-name") or ""):
         instance_id = item["id"]
-        public_ip, private_ip = get_vnic_ips(instance_id, compartment_id, auth_mode)
+        public_ip, private_ip, ip_warning = get_vnic_ips(instance_id, compartment_id, auth_mode)
         probe = {} if args.no_snapshot or args.no_ssh else probe_host(public_ip, env)
         ping_text = "-"
         if args.ping and public_ip:
@@ -298,6 +311,8 @@ def main() -> int:
             f"{ping_text[:10]:10} "
             f"{ssh_text}"
         )
+        if ip_warning:
+            print(f"  warning: {ip_warning}")
         if not args.no_snapshot:
             write_snapshot(item, public_ip, private_ip, env, args.no_ssh, probe=probe)
     if not args.no_snapshot:

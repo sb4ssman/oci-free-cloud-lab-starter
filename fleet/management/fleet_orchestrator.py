@@ -76,6 +76,7 @@ def oci_cmd(args: list[str]) -> dict[str, Any]:
     child_env = os.environ.copy()
     child_env["OCI_CLI_AUTH"] = "instance_principal"
     child_env["OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING"] = "True"
+    child_env["PYTHONWARNINGS"] = "ignore::FutureWarning"
     result = subprocess.run(
         [oci, *args],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -84,11 +85,14 @@ def oci_cmd(args: list[str]) -> dict[str, Any]:
     )
     if result.returncode != 0:
         raise RuntimeError((result.stdout + " " + result.stderr).strip())
+    if not result.stdout.strip():
+        return {"data": []}
     return json.loads(result.stdout)
 
 
 def get_instance_state(name: str, compartment_id: str) -> str | None:
-    data = oci_cmd(["compute", "instance", "list", "--compartment-id", compartment_id, "--all"])
+    data = oci_cmd(["compute", "instance", "list", "--compartment-id", compartment_id,
+                    "--display-name", name])
     for item in data.get("data", []):
         if item.get("display-name") == name:
             state = item.get("lifecycle-state", "")
@@ -98,7 +102,8 @@ def get_instance_state(name: str, compartment_id: str) -> str | None:
 
 
 def get_public_ip(name: str, compartment_id: str) -> str:
-    data = oci_cmd(["compute", "instance", "list", "--compartment-id", compartment_id, "--all"])
+    data = oci_cmd(["compute", "instance", "list", "--compartment-id", compartment_id,
+                    "--display-name", name])
     for item in data.get("data", []):
         if item.get("display-name") == name and item.get("lifecycle-state") == "RUNNING":
             instance_id = item["id"]
@@ -313,6 +318,11 @@ def check_and_repair_fleet(fleet: list[dict[str, Any]], env: dict[str, str]) -> 
             continue
 
         log(f"{name} public IP: {public_ip}")
+        if not vm.get("first_contact", False):
+            ntfy(ntfy_topic, f"{fleet_name}: {name} is live",
+                 f"{name} launched with cloud-init. IP: {public_ip}", tags="rocket,white_check_mark", server=ntfy_server)
+            continue
+
         ok = run_first_contact(public_ip, name, role, env)
 
         if ok:

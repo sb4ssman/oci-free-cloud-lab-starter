@@ -159,13 +159,16 @@ force_key ADMIN_PASSWORD_HASH          {pw_hash}
 echo "[bootstrap] Running role setup..."
 TOOLS_DIR="$HOME/cloud-lab" bash "$HOME/cloud-lab/fleet/management/setup.sh"
 
-echo "[bootstrap] Opening ports 80/443 in iptables..."
+echo "[bootstrap] Opening ports 80/443 and internal 8765 in iptables..."
 sudo apt-get install -y -qq iptables-persistent
 if ! sudo iptables -C INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null; then
     sudo iptables -I INPUT 5 -p tcp --dport 80 -j ACCEPT
 fi
 if ! sudo iptables -C INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null; then
     sudo iptables -I INPUT 5 -p tcp --dport 443 -j ACCEPT
+fi
+if ! sudo iptables -C INPUT -p tcp -s 10.0.0.0/16 --dport 8765 -j ACCEPT 2>/dev/null; then
+    sudo iptables -I INPUT 5 -p tcp -s 10.0.0.0/16 --dport 8765 -j ACCEPT
 fi
 sudo netfilter-persistent save
 

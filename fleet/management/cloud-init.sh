@@ -48,7 +48,7 @@ if [ ! -f /home/ubuntu/.ssh/fleet.key ]; then
 fi
 
 echo "[cloud-init] Writing management.env..."
-mkdir -p /home/ubuntu/.config/cloud-lab
+install -d -m 755 -o ubuntu -g ubuntu /home/ubuntu/.config/cloud-lab
 MANAGEMENT_PRIVATE_IP="$(hostname -I | awk '{print $1}')"
 # Single-quoted heredoc: bash won't re-expand values that Python already substituted.
 cat > /home/ubuntu/.config/cloud-lab/management.env << 'ENVEOF'

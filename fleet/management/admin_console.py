@@ -4,22 +4,25 @@ Cloud Lab admin console — runs on the management VM.
 Accessible at https://<ADMIN_DOMAIN> via Caddy reverse proxy.
 
 Endpoints:
-  GET  /              Fleet status page (login required)
-  GET  /login         Login form
-  POST /login         Validate credentials, set session cookie, redirect to /
-  GET  /logout        Clear session, redirect to /login
-  POST /heartbeat     Liveness pings from worker/laboratory (no auth required)
-  GET  /export        Fleet connection details for downstream projects (login required)
-  GET  /stats?vm=<name>  Live system stats for any fleet VM (login required)
+  GET  /                    Fleet status page (login required)
+  GET  /login               Login form
+  POST /login               Validate credentials, set session cookie, redirect to /
+  GET  /logout              Clear session, redirect to /login
+  POST /heartbeat           Liveness pings from worker/laboratory (no auth)
+  GET  /export              Fleet connection details (login required)
+  GET  /stats?vm=<name>     Live system stats (login required)
+  GET  /logs?vm=<name>&service=<svc>  Journalctl logs (login required)
 """
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import html
 import json
 import os
 import secrets
+import shlex
 import shutil
 import subprocess
 import threading
@@ -30,6 +33,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 
+# ── config ────────────────────────────────────────────────────────────────────
+
 HOST       = os.getenv("ADMIN_CONSOLE_HOST", "127.0.0.1")
 PORT       = int(os.getenv("ADMIN_CONSOLE_PORT", "8765"))
 USERNAME   = os.getenv("ADMIN_USERNAME", "admin")
@@ -37,7 +42,7 @@ PW_HASH    = os.getenv("ADMIN_PASSWORD_HASH", "")
 FLEET_NAME = os.getenv("FLEET_NAME", "Cloud Lab")
 TOOLS_DIR  = Path(os.getenv("CLOUD_LAB_DIR",
              str(Path.home() / "cloud-lab"))).expanduser()
-PROFILE_DIR = TOOLS_DIR / "vm-profiles"
+PROFILE_DIR     = TOOLS_DIR / "vm-profiles"
 HEARTBEATS_FILE = TOOLS_DIR / "vm-profiles" / "_heartbeats.json"
 
 COOKIE_NAME      = "fleet_session"
@@ -49,11 +54,11 @@ _sessions_lock = threading.Lock()
 _heartbeats: dict[str, dict] = {}
 _hb_lock = threading.Lock()
 
-# ip -> (fail_count, window_start)
 _login_fails: dict[str, tuple[int, float]] = {}
 _fails_lock  = threading.Lock()
 MAX_LOGIN_ATTEMPTS = 5
-LOCKOUT_SECONDS    = 900   # 15 minutes
+LOCKOUT_SECONDS    = 900
+_ACT = 'class="active"'   # used in f-string nav links (backslashes not allowed in f-expr)
 
 
 # ── auth helpers ──────────────────────────────────────────────────────────────
@@ -70,12 +75,10 @@ def _verify_password(password: str) -> bool:
 
 
 def _check_rate_limit(ip: str) -> bool:
-    """Return True if the IP is allowed to attempt login, False if locked out."""
     now = time.time()
     with _fails_lock:
         count, window_start = _login_fails.get(ip, (0, now))
         if now - window_start > LOCKOUT_SECONDS:
-            # window expired — reset
             _login_fails[ip] = (0, now)
             return True
         return count < MAX_LOGIN_ATTEMPTS
@@ -157,10 +160,8 @@ def fmt_ago(iso: str) -> str:
     try:
         then = datetime.fromisoformat(iso)
         delta = int((datetime.now(timezone.utc) - then).total_seconds())
-        if delta < 60:
-            return f"{delta}s ago"
-        if delta < 3600:
-            return f"{delta // 60}m ago"
+        if delta < 60:   return f"{delta}s ago"
+        if delta < 3600: return f"{delta // 60}m ago"
         h = delta // 3600
         m = (delta % 3600) // 60
         return f"{h}h {m}m ago"
@@ -176,13 +177,9 @@ def oci_cmd(args: list[str], timeout: int = 60) -> dict:
     child_env["PYTHONWARNINGS"] = "ignore::FutureWarning"
     result = subprocess.run(
         [oci, *args],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        env=child_env,
-        timeout=timeout,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace",
+        env=child_env, timeout=timeout,
     )
     if result.returncode != 0:
         raise RuntimeError((result.stdout + " " + result.stderr).strip())
@@ -195,13 +192,10 @@ def get_vnic_ips(instance_id: str, compartment_id: str) -> tuple[str, str]:
     attachments = oci_cmd(
         ["compute", "vnic-attachment", "list",
          "--compartment-id", compartment_id,
-         "--instance-id", instance_id,
-         "--all"]
+         "--instance-id", instance_id, "--all"]
     ).get("data", [])
-    active = [
-        item for item in attachments
-        if item.get("lifecycle-state") not in ("DETACHING", "DETACHED")
-    ]
+    active = [i for i in attachments
+              if i.get("lifecycle-state") not in ("DETACHING", "DETACHED")]
     if not active:
         return "", ""
     vnic_id = active[0].get("vnic-id", "")
@@ -212,55 +206,44 @@ def get_vnic_ips(instance_id: str, compartment_id: str) -> tuple[str, str]:
 
 
 def refresh_oci_snapshots() -> None:
-    """Refresh vm-profiles from OCI on the management VM itself."""
     env = _mgmt_env()
     compartment_id = env.get("OCI_COMPARTMENT_ID", "")
     if not compartment_id:
         return
-
     fleet = load_json(TOOLS_DIR / "fleet.json") or {"vms": []}
     wanted = {vm.get("name") for vm in fleet.get("vms", []) if vm.get("name")}
     if not wanted:
         return
-
     try:
         instances = oci_cmd(
             ["compute", "instance", "list",
-             "--compartment-id", compartment_id,
-             "--all"],
+             "--compartment-id", compartment_id, "--all"],
             timeout=90,
         ).get("data", [])
     except Exception as exc:
         print(f"[admin_console] OCI refresh failed: {exc}", flush=True)
         return
-
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc).isoformat()
     for item in instances:
-        name = item.get("display-name", "")
+        name  = item.get("display-name", "")
         state = item.get("lifecycle-state", "")
         if name not in wanted or state in ("TERMINATING", "TERMINATED"):
             continue
-        public_ip = ""
-        private_ip = ""
+        public_ip = private_ip = ""
         try:
             public_ip, private_ip = get_vnic_ips(item["id"], compartment_id)
         except Exception as exc:
-            print(f"[admin_console] VNIC refresh failed for {name}: {exc}", flush=True)
+            print(f"[admin_console] VNIC refresh for {name}: {exc}", flush=True)
         snapshot = {
-            "synced_at": now,
-            "public_ip": public_ip,
-            "private_ip": private_ip,
-            "instance": item,
-            "probe": {},
+            "synced_at": now, "public_ip": public_ip,
+            "private_ip": private_ip, "instance": item, "probe": {},
         }
         (PROFILE_DIR / f"{name}.json").write_text(
-            json.dumps(snapshot, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+            json.dumps(snapshot, indent=2, sort_keys=True), encoding="utf-8")
 
 
-# ── live stats ────────────────────────────────────────────────────────────────
+# ── live stats & logs ─────────────────────────────────────────────────────────
 
 def _mgmt_env() -> dict[str, str]:
     out: dict[str, str] = {}
@@ -287,6 +270,32 @@ _STATS_CMD = (
 )
 
 
+def _ssh_run(vm_name: str, remote_cmd: str, timeout: int = 20) -> str:
+    """SSH into a fleet VM and run a command; returns stdout+stderr."""
+    env       = _mgmt_env()
+    ssh_key   = env.get("OCI_SSH_PRIVATE_KEY_PATH", str(Path.home() / ".ssh" / "fleet.key"))
+    ssh_user  = env.get("OCI_SSH_USER", "ubuntu")
+    profile   = load_json(TOOLS_DIR / "vm-profiles" / f"{vm_name}.json") or {}
+    public_ip = profile.get("public_ip", "")
+    if not public_ip or public_ip == "—":
+        return f"No public IP found for {vm_name} in vm-profiles."
+    key_path = str(Path(ssh_key).expanduser())
+    try:
+        result = subprocess.run(
+            ["ssh", "-i", key_path,
+             "-o", "StrictHostKeyChecking=accept-new",
+             "-o", "ConnectTimeout=8", "-o", "BatchMode=yes",
+             f"{ssh_user}@{public_ip}", remote_cmd],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, timeout=timeout,
+        )
+        return result.stdout or "(no output)"
+    except subprocess.TimeoutExpired:
+        return f"SSH timed out connecting to {vm_name} ({public_ip})."
+    except Exception as exc:
+        return f"SSH error for {vm_name} ({public_ip}): {exc}"
+
+
 def collect_local_stats() -> str:
     try:
         result = subprocess.run(
@@ -296,134 +305,441 @@ def collect_local_stats() -> str:
         )
         return result.stdout or "(no output)"
     except Exception as exc:
-        return f"Error collecting local stats: {exc}"
+        return f"Error: {exc}"
 
 
 def collect_remote_stats(vm_name: str) -> str:
     refresh_oci_snapshots()
-    env = _mgmt_env()
-    ssh_key  = env.get("OCI_SSH_PRIVATE_KEY_PATH", str(Path.home() / ".ssh" / "fleet.key"))
-    ssh_user = env.get("OCI_SSH_USER", "ubuntu")
+    return _ssh_run(vm_name, _STATS_CMD, timeout=20)
 
-    # look up public IP from vm-profiles snapshot
-    profile = load_json(TOOLS_DIR / "vm-profiles" / f"{vm_name}.json") or {}
-    public_ip = profile.get("public_ip", "")
-    if not public_ip or public_ip == "—":
-        return f"No public IP found for {vm_name} in vm-profiles. Run check-all-vms first."
 
-    key_path = str(Path(ssh_key).expanduser())
+def collect_local_logs(service: str, lines: int = 200) -> str:
     try:
         result = subprocess.run(
-            ["ssh",
-             "-i", key_path,
-             "-o", "StrictHostKeyChecking=accept-new",
-             "-o", "ConnectTimeout=8",
-             "-o", "BatchMode=yes",
-             f"{ssh_user}@{public_ip}",
-             _STATS_CMD],
+            ["journalctl", "-u", service, "-n", str(lines),
+             "--no-pager", "--output=short-iso"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, timeout=20,
+            text=True, timeout=10,
         )
         return result.stdout or "(no output)"
-    except subprocess.TimeoutExpired:
-        return f"SSH timed out connecting to {vm_name} ({public_ip})."
     except Exception as exc:
-        return f"SSH error for {vm_name} ({public_ip}): {exc}"
+        return f"Error collecting logs: {exc}"
 
 
-def stats_page(vm_name: str, fleet_vms: list) -> bytes:
-    title = html.escape(FLEET_NAME)
-    safe_name = html.escape(vm_name)
-
-    if vm_name == "management":
-        raw = collect_local_stats()
-    else:
-        raw = collect_remote_stats(vm_name)
-
-    output = html.escape(raw)
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
-    vm_links = " &nbsp;·&nbsp; ".join(
-        f'<a href="/stats?vm={html.escape(v)}" {"class=\"active\"" if v == vm_name else ""}>{html.escape(v)}</a>'
-        for v in fleet_vms
-    )
-
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>{title} — {safe_name} stats</title>
-  <style>
-    {COMMON_CSS}
-    .topbar {{ background: #1e293b; color: white; padding: 14px 24px;
-               display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }}
-    .topbar h1 {{ margin: 0; font-size: 18px; }}
-    .topbar nav {{ display: flex; gap: 16px; align-items: center; }}
-    .topbar a {{ color: #94a3b8; font-size: 13px; text-decoration: none; }}
-    .topbar a:hover, .topbar a.active {{ color: white; }}
-    .content {{ max-width: 1000px; margin: 24px auto; padding: 0 16px; }}
-    .vmbar {{ display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; align-items: center; }}
-    .vmbar a {{ padding: 5px 14px; border-radius: 999px; font-size: 13px; font-weight: 500;
-                background: #e2e8f0; color: #374151; text-decoration: none; }}
-    .vmbar a:hover {{ background: #cbd5e1; }}
-    .vmbar a.active {{ background: #1e293b; color: white; }}
-    .meta {{ font-size: 12px; color: #64748b; margin-bottom: 8px; }}
-    pre {{ background: #0f172a; color: #e2e8f0; border-radius: 10px; padding: 20px;
-           font-size: 12.5px; line-height: 1.55; overflow-x: auto; white-space: pre; }}
-    .actions {{ margin-top: 14px; display: flex; gap: 10px; align-items: center; }}
-    .btn {{ padding: 7px 18px; border-radius: 7px; font-size: 13px; font-weight: 600;
-            background: #2563eb; color: white; border: none; cursor: pointer; text-decoration: none; }}
-    .btn:hover {{ background: #1d4ed8; }}
-    label {{ font-size: 13px; color: #374151; display: flex; align-items: center; gap: 6px; cursor: pointer; }}
-  </style>
-  <script>
-    let autoRefresh = false;
-    let timer = null;
-    function toggleAuto(cb) {{
-      autoRefresh = cb.checked;
-      if (autoRefresh) {{
-        timer = setInterval(() => location.reload(), 10000);
-      }} else {{
-        clearInterval(timer);
-      }}
-    }}
-  </script>
-</head>
-<body>
-  <div class="topbar">
-    <h1>{title} — Live Stats</h1>
-    <nav>
-      <a href="/">← Fleet</a>
-      <a href="/export">Export</a>
-      <a href="/logout">Sign out</a>
-    </nav>
-  </div>
-  <div class="content">
-    <div class="vmbar">{vm_links}</div>
-    <p class="meta">Snapshot taken at {now}</p>
-    <pre>{output}</pre>
-    <div class="actions">
-      <a class="btn" href="/stats?vm={html.escape(vm_name)}">Refresh</a>
-      <label><input type="checkbox" onchange="toggleAuto(this)"> Auto-refresh every 10s</label>
-    </div>
-  </div>
-</body>
-</html>""".encode("utf-8")
+def collect_remote_logs(vm_name: str, service: str, lines: int = 200) -> str:
+    refresh_oci_snapshots()
+    cmd = f"sudo journalctl -u {shlex.quote(service)} -n {lines} --no-pager --output=short-iso 2>&1"
+    return _ssh_run(vm_name, cmd, timeout=20)
 
 
-# ── HTML ──────────────────────────────────────────────────────────────────────
+def fleet_events_html() -> str:
+    with _hb_lock:
+        hbs = dict(_heartbeats)
+    all_events: list[dict] = []
+    for vm_name, hb in hbs.items():
+        for ev in hb.get("events", []):
+            all_events.append({
+                "vm": vm_name,
+                "received_at": ev.get("received_at", ""),
+                "event": str(ev.get("event", "")),
+            })
+    all_events.sort(key=lambda e: e.get("received_at", ""), reverse=True)
+    recent = all_events[:10]
+    if not recent:
+        return '<p class="muted">No events recorded yet.</p>'
+    rows = []
+    for ev in recent:
+        rows.append(
+            f'<div class="ev-row">'
+            f'<span class="ev-vm">{html.escape(ev["vm"])}</span>'
+            f'<span class="ev-type">{html.escape(ev["event"])}</span>'
+            f'<span class="ev-time">{html.escape(fmt_ago(ev["received_at"]))}</span>'
+            f'</div>'
+        )
+    return "\n".join(rows)
 
-COMMON_CSS = """
-  body { font-family: system-ui, sans-serif; margin: 0; background: #f0f2f5; color: #17202a; }
+
+# ── CSS / JS constants ────────────────────────────────────────────────────────
+
+# Default palette: Slate — neutral, works with any branding.
+# Users can switch palettes at runtime via the settings panel.
+PALETTE_CSS = """
+:root {
+  --c-primary:    #374151;
+  --c-primary-lt: #4b5563;
+  --c-primary-dk: #1f2937;
+  --c-accent:     #f59e0b;
+  --c-bg:         #f4f6f8;
+  --c-card:       #ffffff;
+  --c-text:       #111827;
+  --c-muted:      #6b7280;
+  --c-border:     #d1d5db;
+  --c-ok:         #dcfce7;  --c-ok-text:   #166534;
+  --c-warn:       #fef9c3;  --c-warn-text: #854d0e;
+  --c-err:        #fee2e2;  --c-err-text:  #991b1b;
+  --c-code-bg:    #0f172a;  --c-code-text: #e2e8f0;
+}
+[data-theme="dark"] {
+  --c-bg:         #111827;
+  --c-card:       #1f2937;
+  --c-text:       #f9fafb;
+  --c-muted:      #9ca3af;
+  --c-border:     #374151;
+  --c-ok:         #14532d;  --c-ok-text:   #bbf7d0;
+  --c-warn:       #422006;  --c-warn-text: #fde68a;
+  --c-err:        #450a0a;  --c-err-text:  #fca5a5;
+  --c-code-bg:    #030712;  --c-code-text: #e2e8f0;
+}
 """
 
+COMMON_CSS = PALETTE_CSS + """
+*, *::before, *::after { box-sizing: border-box; }
+body { font-family: system-ui,-apple-system,sans-serif; margin: 0;
+       background: var(--c-bg); color: var(--c-text);
+       transition: background .15s, color .15s; }
+a { color: var(--c-primary); }  a:hover { color: var(--c-primary-lt); }
+
+/* topbar */
+.topbar { background: var(--c-primary); color: #fff; padding: 0 20px;
+          display: flex; align-items: center; justify-content: space-between;
+          height: 52px; gap: 12px; }
+.topbar-left  { display: flex; align-items: center; gap: 10px; }
+.topbar-logo  { height: 44px; width: auto; display: none;
+                filter: drop-shadow(0 1px 3px rgba(0,0,0,.4)) brightness(1.2); }
+.topbar-logo.visible { display: block; }
+.fleet-name   { font-size: 17px; font-weight: 700; color: #fff; }
+.topbar-nav   { display: flex; align-items: center; gap: 4px; }
+.topbar-nav a, .topbar-nav button {
+  color: rgba(255,255,255,.75); font-size: 13px; font-weight: 500;
+  text-decoration: none; padding: 6px 10px; border-radius: 6px;
+  background: transparent; border: none; cursor: pointer;
+  transition: background .15s, color .15s; }
+.topbar-nav a:hover, .topbar-nav button:hover
+                     { background: rgba(255,255,255,.15); color: #fff; }
+.topbar-nav a.active { background: rgba(255,255,255,.2);  color: #fff; }
+.theme-btn { font-size: 16px; padding: 5px 9px !important; }
+.sign-out  { opacity: .65; }
+
+/* layout */
+.content { max-width: 1060px; margin: 28px auto; padding: 0 16px; }
+
+/* cards */
+.grid { display: grid; gap: 14px;
+        grid-template-columns: repeat(auto-fit, minmax(290px,1fr)); }
+.card { background: var(--c-card); border: 1px solid var(--c-border);
+        border-radius: 12px; padding: 18px 20px;
+        transition: background .15s, border-color .15s; }
+.card-header { display: flex; justify-content: space-between;
+               align-items: center; margin-bottom: 12px; }
+.vm-name { font-size: 17px; font-weight: 700; }
+.badge { border-radius: 999px; padding: 3px 11px; font-size: 12px;
+         font-weight: 600; background: var(--c-border); color: var(--c-muted); }
+.badge.running     { background: var(--c-ok);  color: var(--c-ok-text); }
+.badge.terminated,
+.badge.terminating { background: var(--c-err); color: var(--c-err-text); }
+.card p   { margin: 4px 0; font-size: 14px; }
+.card p b { color: var(--c-muted); font-weight: 600; }
+.notes    { color: var(--c-muted); font-size: 13px; margin-top: 8px; }
+.warn-text { color: var(--c-warn-text); }
+
+/* card actions */
+.card-actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+.act-btn {
+  font-size: 12px; font-weight: 600; padding: 4px 12px;
+  border-radius: 6px; text-decoration: none; cursor: pointer;
+  background: var(--c-bg); border: 1px solid var(--c-border);
+  color: var(--c-primary); transition: background .12s; }
+.act-btn:hover { background: var(--c-border); color: var(--c-primary-dk); }
+.act-btn.accent { background: var(--c-accent); border-color: var(--c-accent); color: #fff; }
+.act-btn.accent:hover { filter: brightness(1.1); }
+
+/* fleet events */
+.section-title { font-size: 15px; font-weight: 700; margin: 28px 0 10px; }
+.ev-row { display: flex; gap: 12px; align-items: baseline; padding: 7px 0;
+          border-bottom: 1px solid var(--c-border); font-size: 13px; }
+.ev-vm   { font-weight: 600; color: var(--c-primary); min-width: 90px; }
+.ev-type { flex: 1; }
+.ev-time { color: var(--c-muted); white-space: nowrap; }
+
+/* vmbar / svcbar */
+.vmbar, .svcbar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+.vmbar a { padding: 5px 14px; border-radius: 999px; font-size: 13px; font-weight: 500;
+           background: var(--c-border); color: var(--c-text); text-decoration: none; }
+.svcbar a { padding: 4px 12px; border-radius: 8px; font-size: 12px; font-weight: 500;
+            background: var(--c-bg); border: 1px solid var(--c-border);
+            color: var(--c-text); text-decoration: none; }
+.vmbar a:hover, .svcbar a:hover { background: var(--c-primary-lt); color: #fff; }
+.vmbar a.active, .svcbar a.active { background: var(--c-primary); color: #fff; }
+
+/* pre/code */
+pre { background: var(--c-code-bg); color: var(--c-code-text);
+      border-radius: 10px; padding: 18px 20px; font-size: 12.5px;
+      line-height: 1.6; overflow-x: auto; white-space: pre; }
+.meta { font-size: 12px; color: var(--c-muted); margin-bottom: 8px; }
+
+/* buttons */
+.btn { display: inline-block; padding: 8px 20px; border-radius: 8px;
+       font-size: 13px; font-weight: 700; background: var(--c-primary);
+       color: #fff; border: none; cursor: pointer; text-decoration: none; }
+.btn:hover { background: var(--c-primary-lt); color: #fff; }
+label { font-size: 13px; color: var(--c-text);
+        display: flex; align-items: center; gap: 6px; cursor: pointer; }
+
+/* settings panel */
+.settings-panel {
+  position: fixed; top: 52px; right: 0; width: 240px;
+  background: var(--c-card); border-left: 1px solid var(--c-border);
+  border-bottom: 1px solid var(--c-border); border-radius: 0 0 0 12px;
+  padding: 16px; box-shadow: -4px 4px 16px #0002; z-index: 100; }
+.settings-panel h3 { margin: 0 0 10px; font-size: 11px; color: var(--c-muted);
+                     text-transform: uppercase; letter-spacing: .5px; }
+.palette-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.palette-btn  { border: 3px solid transparent; border-radius: 8px; padding: 8px 4px;
+                color: #fff; font-size: 12px; font-weight: 700; cursor: pointer;
+                text-shadow: 0 1px 3px #0006; transition: border-color .15s, opacity .15s; }
+.palette-btn:hover, .palette-btn.active { border-color: var(--btn-accent, var(--c-accent)); opacity: 1; }
+.palette-btn:not(:hover):not(.active) { opacity: .85; }
+.custom-panel { margin-top: 12px; border-top: 1px solid var(--c-border); padding-top: 12px; }
+.custom-panel label { display: flex; justify-content: space-between; align-items: center;
+                      font-size: 12px; margin-bottom: 6px; color: var(--c-text); }
+.custom-panel input[type=color] { width: 36px; height: 26px; padding: 0; border: 1px solid var(--c-border);
+                                   border-radius: 4px; cursor: pointer; background: none; }
+.custom-panel input[type=url],
+.custom-panel input[type=text] { width: 100%; padding: 5px 8px; font-size: 11px; margin-top: 4px;
+                                  border: 1px solid var(--c-border); border-radius: 5px;
+                                  background: var(--c-bg); color: var(--c-text); }
+.custom-hint  { font-size: 10px; color: var(--c-muted); margin: 2px 0 8px; line-height: 1.4; }
+
+/* login */
+.login-wrap { display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+.login-box  { background: var(--c-card); border: 1px solid var(--c-border);
+              border-radius: 14px; padding: 38px 34px; width: 100%; max-width: 360px;
+              box-shadow: 0 4px 24px #0002; }
+.login-logo { height: 88px; display: none; margin: 0 auto 18px; }
+.login-logo.visible { display: block; }
+.login-box h1   { margin: 0 0 4px; font-size: 22px; text-align: center; }
+.login-box .sub { margin: 0 0 22px; color: var(--c-muted); font-size: 14px; text-align: center; }
+.login-box label { display: block; font-size: 13px; font-weight: 600;
+                   margin-bottom: 4px; color: var(--c-muted); }
+.login-box input { width: 100%; padding: 10px 12px; font-size: 15px;
+                   border: 1px solid var(--c-border); border-radius: 8px;
+                   margin-bottom: 14px; background: var(--c-bg);
+                   color: var(--c-text); outline: none; }
+.login-box input:focus { border-color: var(--c-primary); box-shadow: 0 0 0 3px rgba(55,65,81,.15); }
+.login-box button { width: 100%; padding: 11px; font-size: 15px; font-weight: 700;
+                    background: var(--c-primary); color: #fff; border: none;
+                    border-radius: 8px; cursor: pointer; }
+.login-box button:hover { background: var(--c-primary-lt); }
+.error-msg { color: var(--c-err-text); font-size: 13px; margin: 0 0 14px; }
+.export-pre { background: var(--c-card); border: 1px solid var(--c-border);
+              border-radius: 10px; padding: 20px; font-size: 13px;
+              overflow-x: auto; white-space: pre-wrap; color: var(--c-text); }
+footer { text-align: center; font-size: 12px; color: var(--c-muted); padding: 20px 16px; }
+"""
+
+# localStorage keys use 'fleet-' prefix (not 'mda-') for the generic starter.
+THEME_JS = """
+(function() {
+  var saved = localStorage.getItem('fleet-theme');
+  var pref  = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  var t = saved || pref;
+  document.documentElement.setAttribute('data-theme', t);
+  var icon = document.getElementById('theme-icon');
+  if (icon) icon.textContent = t === 'dark' ? '☀' : '🌙';
+
+  var pal = localStorage.getItem('fleet-palette');
+  if (pal) { try {
+    var p = JSON.parse(pal);
+    var r = document.documentElement;
+    r.style.setProperty('--c-primary',    p.primary);
+    if (p.primaryLt) r.style.setProperty('--c-primary-lt', p.primaryLt);
+    if (p.primaryDk) r.style.setProperty('--c-primary-dk', p.primaryDk);
+    if (p.accent)    r.style.setProperty('--c-accent',     p.accent);
+  } catch(e) {} }
+
+  var logo = localStorage.getItem('fleet-logo');
+  if (logo) {
+    document.querySelectorAll('.topbar-logo,.login-logo').forEach(function(img) {
+      img.src = logo; img.classList.add('visible');
+    });
+  }
+})();
+
+function toggleTheme() {
+  var t = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', t);
+  localStorage.setItem('fleet-theme', t);
+  var icon = document.getElementById('theme-icon');
+  if (icon) icon.textContent = t === 'dark' ? '☀' : '🌙';
+}
+
+var _spOpen = false;
+function toggleSettings() {
+  _spOpen = !_spOpen;
+  var sp = document.getElementById('settings-panel');
+  if (sp) sp.hidden = !_spOpen;
+}
+
+var _cpOpen = false;
+function toggleCustomPanel() {
+  _cpOpen = !_cpOpen;
+  var cp = document.getElementById('custom-panel');
+  if (cp) cp.hidden = !_cpOpen;
+}
+
+function applyPalette(btn) {
+  var p  = btn.dataset.primary;
+  var pl = btn.dataset.primaryLt;
+  var pd = btn.dataset.primaryDk;
+  var a  = btn.dataset.accent;
+  var r  = document.documentElement;
+  r.style.setProperty('--c-primary',    p);
+  r.style.setProperty('--c-primary-lt', pl);
+  r.style.setProperty('--c-primary-dk', pd);
+  r.style.setProperty('--c-accent',     a);
+  localStorage.setItem('fleet-palette', JSON.stringify({primary:p,primaryLt:pl,primaryDk:pd,accent:a}));
+  document.querySelectorAll('.palette-btn').forEach(function(b) {
+    b.classList.toggle('active', b === btn);
+  });
+}
+
+function applyCustomPalette() {
+  var p  = document.getElementById('cp-primary').value;
+  var pl = document.getElementById('cp-primary-lt').value;
+  var pd = document.getElementById('cp-primary-dk').value;
+  var a  = document.getElementById('cp-accent').value;
+  var logo = (document.getElementById('cp-logo') || {value:''}).value.trim();
+  var r = document.documentElement;
+  r.style.setProperty('--c-primary',    p);
+  r.style.setProperty('--c-primary-lt', pl);
+  r.style.setProperty('--c-primary-dk', pd);
+  r.style.setProperty('--c-accent',     a);
+  localStorage.setItem('fleet-palette', JSON.stringify({primary:p,primaryLt:pl,primaryDk:pd,accent:a}));
+  if (logo) {
+    document.querySelectorAll('.topbar-logo,.login-logo').forEach(function(img) {
+      img.src = logo; img.classList.add('visible');
+    });
+    localStorage.setItem('fleet-logo', logo);
+  }
+  document.querySelectorAll('.palette-btn').forEach(function(b) { b.classList.remove('active'); });
+}
+
+function copyText(text, btn) {
+  navigator.clipboard.writeText(text).then(function() {
+    var orig = btn.textContent;
+    btn.textContent = 'Copied!';
+    setTimeout(function() { btn.textContent = orig; }, 1500);
+  }).catch(function() { prompt('Copy:', text); });
+}
+"""
+
+# Five named presets + the Custom slot rendered separately in _topbar().
+# Tuple: (primary, primary_lt, primary_dk, accent, label)
+PALETTE_PRESETS = [
+    ("#374151", "#4b5563", "#1f2937", "#f59e0b", "Slate"),       # default neutral
+    ("#1a3d6e", "#2d6cb5", "#0f2547", "#38bdf8", "Ocean"),       # navy + sky blue
+    ("#285e39", "#3a7a50", "#1b3f28", "#c5a028", "MDA Green"),   # forest green + gold
+    ("#0d1117", "#1c2128", "#010409", "#39ff14", "Neons"),       # near-black + neon green
+    ("#6b4226", "#8a5530", "#4a2d1b", "#d4882a", "Earthy"),     # terracotta + warm amber
+]
+
+_LOG_SERVICES = [
+    ("cloud-lab-a1-lottery",   "Lottery"),
+    ("cloud-lab-orchestrator", "Orchestrator"),
+    ("cloud-lab-console",      "Console"),
+    ("cloud-lab-heartbeat",    "Heartbeat"),
+    ("cloud-lab-crosswatch",   "Crosswatch"),
+    ("cloud-lab-update",       "Update"),
+]
+
+
+# ── shared HTML helpers ───────────────────────────────────────────────────────
+
+def _head(title: str, auto_refresh: int = 0) -> str:
+    refresh = f'<meta http-equiv="refresh" content="{auto_refresh}">' if auto_refresh else ""
+    return (
+        f'<!doctype html><html lang="en"><head>'
+        f'<meta charset="utf-8">'
+        f'<meta name="viewport" content="width=device-width,initial-scale=1">'
+        f'{refresh}'
+        f'<title>{html.escape(title)}</title>'
+        f'<style>{COMMON_CSS}</style>'
+        f'<script>{THEME_JS}</script>'
+        f'</head><body>'
+    )
+
+
+def _topbar(active: str = "") -> str:
+    nav_items = [
+        ("Fleet",  "/",       "fleet"),
+        ("Stats",  "/stats",  "stats"),
+        ("Logs",   "/logs",   "logs"),
+        ("Export", "/export", "export"),
+    ]
+    links = " ".join(
+        f'<a href="{href}" {_ACT if active == key else ""}>{label}</a>'
+        for label, href, key in nav_items
+    )
+    preset_btns = " ".join(
+        f'<button class="palette-btn"'
+        f' style="background:{p};--btn-accent:{a}"'
+        f' data-primary="{p}" data-primary-lt="{pl}"'
+        f' data-primary-dk="{pd}" data-accent="{a}"'
+        f' onclick="applyPalette(this)">{name}</button>'
+        for p, pl, pd, a, name in PALETTE_PRESETS
+    )
+    # Custom button: diagonal split of two grays to suggest "make your own"
+    custom_btn = (
+        '<button class="palette-btn"'
+        ' style="background:linear-gradient(135deg,#4b5563 55%,#9ca3af 45%)"'
+        ' onclick="toggleCustomPanel()">Custom</button>'
+    )
+    custom_panel = (
+        '<div id="custom-panel" class="custom-panel" hidden>'
+        '<h3>Pick colors</h3>'
+        '<label>Primary <input type="color" id="cp-primary" value="#374151"></label>'
+        '<label>Primary (light) <input type="color" id="cp-primary-lt" value="#4b5563"></label>'
+        '<label>Primary (dark) <input type="color" id="cp-primary-dk" value="#1f2937"></label>'
+        '<label>Accent <input type="color" id="cp-accent" value="#f59e0b"></label>'
+        '<h3 style="margin-top:10px">Logo</h3>'
+        '<input type="url" id="cp-logo" placeholder="https://... or data:image/...">'
+        '<p class="custom-hint">'
+        'PNG or SVG &middot; transparent background &middot; ~44 px tall<br>'
+        'To embed locally: <code>base64 -w0 logo.png</code> then prefix with<br>'
+        '<code>data:image/png;base64,</code>'
+        '</p>'
+        '<button class="btn" onclick="applyCustomPalette()" style="width:100%;padding:7px;margin-top:4px">Apply</button>'
+        '</div>'
+    )
+    return (
+        f'<div class="topbar">'
+        f'<div class="topbar-left">'
+        f'<img id="topbar-logo" class="topbar-logo" alt="Fleet Logo">'
+        f'<span class="fleet-name">{html.escape(FLEET_NAME)}</span>'
+        f'</div>'
+        f'<nav class="topbar-nav">{links}'
+        f'<button class="theme-btn" title="Toggle dark/light" onclick="toggleTheme()">'
+        f'<span id="theme-icon">&#127769;</span></button>'
+        f'<button class="theme-btn" title="Appearance" onclick="toggleSettings()">&#9881;</button>'
+        f'<a href="/logout" class="sign-out">Sign out</a>'
+        f'</nav></div>'
+        f'<div id="settings-panel" class="settings-panel" hidden>'
+        f'<h3>Color palette</h3>'
+        f'<div class="palette-grid">{preset_btns}{custom_btn}</div>'
+        f'{custom_panel}'
+        f'</div>'
+    )
+
+
+# ── VM cards ──────────────────────────────────────────────────────────────────
 
 def vm_cards() -> str:
     refresh_oci_snapshots()
     fleet = load_json(TOOLS_DIR / "fleet.json") or {"vms": []}
     with _hb_lock:
         hbs = dict(_heartbeats)
+    env      = _mgmt_env()
+    ssh_user = env.get("OCI_SSH_USER", "ubuntu")
 
     cards = []
     for vm in fleet.get("vms", []):
@@ -431,206 +747,186 @@ def vm_cards() -> str:
         profile    = load_json(PROFILE_DIR / f"{name}.json") or {}
         instance   = profile.get("instance", {})
         state      = instance.get("lifecycle-state", "UNKNOWN")
-        public_ip  = profile.get("public_ip", "—")
-        private_ip = profile.get("private_ip", "—")
-        synced_at  = fmt_ago(profile["synced_at"]) if profile.get("synced_at") else "never"
+        shape      = html.escape(instance.get("shape") or vm.get("shape", ""))
+        public_ip  = html.escape(profile.get("public_ip") or "—")
+        private_ip = html.escape(profile.get("private_ip") or "—")
+        role_label = html.escape(vm.get("role", name))
+        notes      = html.escape(vm.get("notes", ""))
+        synced_at  = profile.get("synced_at", "")
 
         hb = hbs.get(name, {})
-        if hb:
-            hb_html = (
-                f'<p><b>Heartbeat:</b> {html.escape(fmt_ago(hb.get("received_at", "")))} '
-                f'— uptime {html.escape(hb.get("uptime", "?"))}</p>'
+        hb_time  = hb.get("received_at", "")
+        hb_ago   = fmt_ago(hb_time) if hb_time else '<span class="warn-text">not received yet</span>'
+        uptime   = html.escape(hb.get("uptime", "") or "—")
+        snap_ago = fmt_ago(synced_at) if synced_at else "never"
+
+        state_cls = state.lower().replace(" ", "-")
+        badge = f'<span class="badge {state_cls}">{html.escape(state)}</span>'
+
+        ssh_cmd = f"ssh -i ~/.ssh/fleet.key {ssh_user}@{public_ip}"
+
+        actions = [
+            f'<a class="act-btn" href="/stats?vm={html.escape(name)}">Live stats</a>',
+            f'<a class="act-btn" href="/logs?vm={html.escape(name)}">Logs</a>',
+        ]
+        if public_ip != "—":
+            actions.append(
+                f'<button class="act-btn" onclick="copyText({json.dumps(ssh_cmd)},this)">Copy SSH</button>'
             )
-        elif vm.get("role") != "management":
-            hb_html = '<p class="warn"><b>Heartbeat:</b> not received yet</p>'
-        else:
-            hb_html = ""
+        if name == "worker":
+            actions.append(
+                '<a class="act-btn accent" href="/logs?vm=worker&service=cloud-lab-a1-lottery">Lottery logs</a>'
+            )
 
-        sc = state.lower().replace("/", "-")
-        stats_link = f'<a class="stats-link" href="/stats?vm={html.escape(name)}">Live stats ›</a>'
-        cards.append(f"""<div class="card">
-  <div class="card-header">
-    <span class="name">{html.escape(name)}</span>
-    <span class="badge {html.escape(sc)}">{html.escape(state)}</span>
-  </div>
-  <p><b>Role:</b> {html.escape(vm.get('role', ''))}</p>
-  <p><b>Shape:</b> {html.escape(instance.get('shape') or vm.get('shape', ''))}</p>
-  <p><b>Public IP:</b> {html.escape(public_ip)}</p>
-  <p><b>Private IP:</b> {html.escape(private_ip)}</p>
-  <p><b>OCI snapshot:</b> {html.escape(synced_at)}</p>
-  {hb_html}
-  <p class="notes">{html.escape(vm.get('notes', ''))}</p>
-  {stats_link}
-</div>""")
-    return "\n".join(cards) if cards else "<p>No VMs defined in fleet.json.</p>"
-
-
-def fleet_page() -> bytes:
-    title = html.escape(FLEET_NAME)
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta http-equiv="refresh" content="60">
-  <title>{title}</title>
-  <style>
-    {COMMON_CSS}
-    .topbar {{ background: #1e293b; color: white; padding: 14px 24px;
-               display: flex; justify-content: space-between; align-items: center; }}
-    .topbar h1 {{ margin: 0; font-size: 18px; letter-spacing: .5px; }}
-    .topbar nav {{ display: flex; gap: 16px; }}
-    .topbar a {{ color: #94a3b8; font-size: 13px; text-decoration: none; }}
-    .topbar a:hover {{ color: white; }}
-    .grid {{ max-width: 1060px; margin: 24px auto; padding: 0 16px;
-             display: grid; gap: 14px;
-             grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); }}
-    .card {{ background: white; border: 1px solid #dde1e7; border-radius: 10px; padding: 18px; }}
-    .card-header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }}
-    .name {{ font-size: 17px; font-weight: 600; }}
-    p {{ margin: 5px 0; font-size: 14px; }}
-    .badge {{ border-radius: 999px; padding: 3px 10px; font-size: 12px; font-weight: 500;
-              background: #e2e8f0; color: #475569; }}
-    .running {{ background: #dcfce7; color: #166534; }}
-    .terminated, .terminating {{ background: #fee2e2; color: #991b1b; }}
-    .warn {{ color: #92400e; }}
-    .notes {{ color: #64748b; font-size: 13px; }}
-    .stats-link {{ display: inline-block; margin-top: 8px; font-size: 12px; font-weight: 600;
-                   color: #2563eb; text-decoration: none; }}
-    .stats-link:hover {{ color: #1d4ed8; text-decoration: underline; }}
-    footer {{ text-align: center; font-size: 12px; color: #94a3b8; padding: 16px; }}
-  </style>
-</head>
-<body>
-  <div class="topbar">
-    <h1>{title}</h1>
-    <nav>
-      <a href="/stats">Stats</a>
-      <a href="/export">Export config</a>
-      <a href="/logout">Sign out</a>
-    </nav>
-  </div>
-  <div class="grid">{vm_cards()}</div>
-  <footer>Auto-refreshes every 60s &nbsp;·&nbsp; management VM</footer>
-</body>
-</html>""".encode("utf-8")
+        cards.append(
+            f'<div class="card">'
+            f'<div class="card-header">'
+            f'<span class="vm-name">{html.escape(name)}</span>{badge}'
+            f'</div>'
+            f'<p><b>Role:</b> {role_label}</p>'
+            f'<p><b>Shape:</b> {shape}</p>'
+            f'<p><b>Uptime:</b> {uptime}</p>'
+            f'<p><b>Public IP:</b> {public_ip}</p>'
+            f'<p><b>Private IP:</b> {private_ip}</p>'
+            f'<p><b>OCI snapshot:</b> {html.escape(snap_ago)}</p>'
+            f'<p><b>Heartbeat:</b> {hb_ago}</p>'
+            + (f'<p class="notes">{notes}</p>' if notes else "")
+            + f'<div class="card-actions">{"".join(actions)}</div>'
+            f'</div>'
+        )
+    return "\n".join(cards)
 
 
-def export_page() -> bytes:
-    """Fleet connection details — copy these into your downstream project's .env."""
-    refresh_oci_snapshots()
-    fleet = load_json(TOOLS_DIR / "fleet.json") or {"vms": []}
-    fleet_name = html.escape(FLEET_NAME)
+# ── stats page ────────────────────────────────────────────────────────────────
 
-    lines = [f"# Fleet connection details — generated by {FLEET_NAME} management console",
-             f"# Copy relevant values into your project's .env\n"]
-    for vm in fleet.get("vms", []):
-        name = vm.get("name", "")
-        profile = load_json(PROFILE_DIR / f"{name}.json") or {}
-        pub = profile.get("public_ip", "")
-        priv = profile.get("private_ip", "")
-        role = vm.get("role", "")
-        lines.append(f"# {name} ({role})")
-        slug = name.upper().replace("-", "_")
-        lines.append(f"OCI_{slug}_HOST={pub}")
-        lines.append(f"OCI_{slug}_PRIVATE_IP={priv}")
-        lines.append("")
+def stats_page(vm_name: str, fleet_vms: list) -> bytes:
+    title  = f"{FLEET_NAME} — {vm_name} stats"
+    raw    = collect_local_stats() if vm_name == "management" else collect_remote_stats(vm_name)
+    output = html.escape(raw)
+    now    = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    vm_links = " ".join(
+        f'<a href="/stats?vm={html.escape(v)}" {_ACT if v == vm_name else ""}>{html.escape(v)}</a>'
+        for v in fleet_vms
+    )
+    page = (
+        _head(title)
+        + _topbar("stats")
+        + f'<div class="content">'
+        + f'<div class="vmbar">{vm_links}</div>'
+        + f'<p class="meta">Snapshot taken {now}</p>'
+        + f'<pre>{output}</pre>'
+        + '<div style="display:flex;gap:12px;align-items:center;margin-top:12px">'
+        + f'<a class="btn" href="/stats?vm={html.escape(vm_name)}">Refresh</a>'
+        + '<label><input type="checkbox" onchange="(function(cb){'
+        + 'if(cb.checked){window._ar=setInterval(()=>location.reload(),10000)}'
+        + 'else{clearInterval(window._ar)}})(this)"> Auto-refresh 10s</label>'
+        + '</div></div></body></html>'
+    )
+    return page.encode("utf-8")
 
-    env_file = TOOLS_DIR / ".config" / "cloud-lab" / "management.env"
-    mgmt_env = {}
-    if (Path.home() / ".config" / "cloud-lab" / "management.env").exists():
-        for raw in (Path.home() / ".config" / "cloud-lab" / "management.env").read_text().splitlines():
-            if "=" in raw and not raw.startswith("#"):
-                k, v = raw.split("=", 1)
-                mgmt_env[k.strip()] = v.strip()
 
-    lines.append(f"FLEET_MANAGEMENT_PRIVATE_IP={mgmt_env.get('FLEET_MANAGEMENT_PRIVATE_IP', '')}")
-    lines.append(f"OCI_SSH_USER=ubuntu")
-    lines.append(f"# SSH key: ~/.ssh/fleet.key  (from the management VM)")
+# ── logs page ─────────────────────────────────────────────────────────────────
 
-    config_text = html.escape("\n".join(lines))
-    title = fleet_name
+def logs_page(vm_name: str, service_name: str, fleet_vms: list) -> bytes:
+    title  = f"{FLEET_NAME} — {vm_name} logs"
+    raw    = (collect_local_logs(service_name) if vm_name == "management"
+              else collect_remote_logs(vm_name, service_name))
+    output = html.escape(raw)
+    now    = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    vm_links = " ".join(
+        f'<a href="/logs?vm={html.escape(v)}&service={html.escape(service_name)}" '
+        f'{_ACT if v == vm_name else ""}>{html.escape(v)}</a>'
+        for v in fleet_vms
+    )
+    svc_links = " ".join(
+        f'<a href="/logs?vm={html.escape(vm_name)}&service={html.escape(svc)}" '
+        f'{_ACT if svc == service_name else ""}>{html.escape(label)}</a>'
+        for svc, label in _LOG_SERVICES
+    )
+    page = (
+        _head(title)
+        + _topbar("logs")
+        + f'<div class="content">'
+        + f'<div class="vmbar">{vm_links}</div>'
+        + f'<div class="svcbar">{svc_links}</div>'
+        + f'<p class="meta">Fetched {now}</p>'
+        + f'<pre>{output}</pre>'
+        + '<div style="display:flex;gap:12px;align-items:center;margin-top:12px">'
+        + f'<a class="btn" href="/logs?vm={html.escape(vm_name)}&service={html.escape(service_name)}">Refresh</a>'
+        + '<label><input type="checkbox" onchange="(function(cb){'
+        + 'if(cb.checked){window._ar=setInterval(()=>location.reload(),15000)}'
+        + 'else{clearInterval(window._ar)}})(this)"> Auto-refresh 15s</label>'
+        + '</div></div></body></html>'
+    )
+    return page.encode("utf-8")
 
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>{title} — Export</title>
-  <style>
-    {COMMON_CSS}
-    .topbar {{ background: #1e293b; color: white; padding: 14px 24px;
-               display: flex; justify-content: space-between; align-items: center; }}
-    .topbar h1 {{ margin: 0; font-size: 18px; }}
-    .topbar a {{ color: #94a3b8; font-size: 13px; text-decoration: none; }}
-    .topbar a:hover {{ color: white; }}
-    .content {{ max-width: 700px; margin: 32px auto; padding: 0 16px; }}
-    h2 {{ font-size: 16px; color: #374151; }}
-    pre {{ background: white; border: 1px solid #dde1e7; border-radius: 8px;
-           padding: 20px; font-size: 13px; overflow-x: auto; white-space: pre-wrap; }}
-    p.hint {{ color: #64748b; font-size: 13px; }}
-  </style>
-</head>
-<body>
-  <div class="topbar">
-    <h1>{title}</h1>
-    <a href="/">← Fleet</a>
-  </div>
-  <div class="content">
-    <h2>Fleet connection details</h2>
-    <p class="hint">Copy the values your downstream project needs into its own .env file.</p>
-    <pre>{config_text}</pre>
-  </div>
-</body>
-</html>""".encode("utf-8")
 
+# ── login page ────────────────────────────────────────────────────────────────
 
 def login_page(error: bool = False, locked: bool = False) -> bytes:
-    title = html.escape(FLEET_NAME)
     if locked:
-        err = '<p class="error">Too many failed attempts. Try again in 15 minutes.</p>'
+        err = '<p class="error-msg">Too many failed attempts. Try again in 15 minutes.</p>'
     elif error:
-        err = '<p class="error">Incorrect username or password.</p>'
+        err = '<p class="error-msg">Incorrect username or password.</p>'
     else:
         err = ""
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>{title} — Sign In</title>
-  <style>
-    {COMMON_CSS}
-    body {{ display: flex; align-items: center; justify-content: center; min-height: 100vh; }}
-    .box {{ background: white; border: 1px solid #dde1e7; border-radius: 12px;
-            padding: 36px 32px; width: 100%; max-width: 360px; box-shadow: 0 2px 12px #0001; }}
-    h1 {{ margin: 0 0 6px; font-size: 22px; }}
-    p.sub {{ margin: 0 0 24px; color: #64748b; font-size: 14px; }}
-    label {{ display: block; font-size: 13px; font-weight: 600; margin-bottom: 4px; color: #374151; }}
-    input {{ width: 100%; box-sizing: border-box; padding: 10px 12px; font-size: 15px;
-             border: 1px solid #d1d5db; border-radius: 7px; margin-bottom: 14px; outline: none; }}
-    input:focus {{ border-color: #2563eb; box-shadow: 0 0 0 3px #2563eb22; }}
-    button {{ width: 100%; padding: 11px; font-size: 15px; font-weight: 600;
-              background: #2563eb; color: white; border: none; border-radius: 7px; cursor: pointer; }}
-    button:hover {{ background: #1d4ed8; }}
-    .error {{ color: #dc2626; font-size: 13px; margin: 0 0 14px; }}
-  </style>
-</head>
-<body>
-  <div class="box">
-    <h1>{title}</h1>
-    <p class="sub">Private admin console</p>
-    {err}
-    <form method="POST" action="/login">
-      <label for="u">Username</label>
-      <input id="u" type="text" name="username" autocomplete="username" autofocus>
-      <label for="p">Password</label>
-      <input id="p" type="password" name="password" autocomplete="current-password">
-      <button type="submit">Sign in</button>
-    </form>
-  </div>
-</body>
-</html>""".encode("utf-8")
+    page = (
+        _head(FLEET_NAME)
+        + f'<div class="login-wrap"><div class="login-box">'
+        + f'<img id="login-logo" class="login-logo" alt="Fleet Logo">'
+        + f'<h1>{html.escape(FLEET_NAME)}</h1>'
+        + '<p class="sub">Private admin console</p>'
+        + f'{err}'
+        + '<form method="POST" action="/login">'
+        + '<label for="u">Username</label>'
+        + '<input id="u" type="text" name="username" autocomplete="username" autofocus>'
+        + '<label for="p">Password</label>'
+        + '<input id="p" type="password" name="password" autocomplete="current-password">'
+        + '<button type="submit">Sign in</button>'
+        + '</form></div></div></body></html>'
+    )
+    return page.encode("utf-8")
+
+
+# ── export page ───────────────────────────────────────────────────────────────
+
+def export_page() -> bytes:
+    fleet = load_json(TOOLS_DIR / "fleet.json") or {"vms": []}
+    env   = _mgmt_env()
+    lines = [
+        f"# {FLEET_NAME} — Fleet Connection Details",
+        f"# Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+        "",
+    ]
+    for vm in fleet.get("vms", []):
+        name    = vm.get("name", "")
+        profile = load_json(PROFILE_DIR / f"{name}.json") or {}
+        pub     = profile.get("public_ip", "")
+        priv    = profile.get("private_ip", "")
+        lines += [
+            f"# {name.upper()}",
+            f"OCI_{name.upper()}_HOST={pub}",
+            f"OCI_{name.upper()}_PRIVATE_IP={priv}",
+            "",
+        ]
+    ssh_key = env.get("OCI_SSH_PRIVATE_KEY_PATH", "~/.ssh/fleet.key")
+    ssh_user = env.get("OCI_SSH_USER", "ubuntu")
+    lines += [
+        "# SSH",
+        f"OCI_SSH_USER={ssh_user}",
+        f"OCI_SSH_PRIVATE_KEY_PATH={ssh_key}",
+        f"# SSH example: {ssh_key} {ssh_user}@<public-ip>",
+    ]
+    content = html.escape("\n".join(lines))
+    page = (
+        _head(f"{FLEET_NAME} — Export")
+        + _topbar("export")
+        + f'<div class="content">'
+        + f'<h2 style="margin:0 0 16px">Fleet connection details</h2>'
+        + f'<pre class="export-pre">{content}</pre>'
+        + '</div></body></html>'
+    )
+    return page.encode("utf-8")
 
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────
@@ -642,112 +938,149 @@ class Handler(BaseHTTPRequestHandler):
         qs     = parse_qs(parsed.query)
 
         if path == "/login":
-            self._html(200, login_page())
-        elif path == "/logout":
-            cookies = _parse_cookies(self.headers.get("Cookie", ""))
-            sid = cookies.get(COOKIE_NAME, "")
-            if sid:
-                with _sessions_lock:
-                    _sessions.pop(sid, None)
-            self.send_response(302)
-            self.send_header("Location", "/login")
-            self.send_header("Set-Cookie",
-                f"{COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
-            self.end_headers()
-        elif not _is_authed(self):
-            self.send_response(302)
-            self.send_header("Location", "/login")
-            self.end_headers()
-        elif path == "/export":
-            self._html(200, export_page())
-        elif path == "/stats":
-            fleet = load_json(TOOLS_DIR / "fleet.json") or {"vms": []}
-            fleet_names = [v.get("name", "") for v in fleet.get("vms", []) if v.get("name")]
-            vm_name = (qs.get("vm") or ["management"])[0]
-            if vm_name not in fleet_names:
+            self._html(200, login_page()); return
+        if path == "/logout":
+            self._redirect("/login",
+                           f'{COOKIE_NAME}=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict')
+            return
+
+        if not _is_authed(self):
+            self._redirect("/login"); return
+
+        if path == "/":
+            fleet  = load_json(TOOLS_DIR / "fleet.json") or {"vms": []}
+            names  = [v.get("name") for v in fleet.get("vms", []) if v.get("name")]
+            cards  = vm_cards()
+            events = fleet_events_html()
+            page = (
+                _head(FLEET_NAME, auto_refresh=60)
+                + _topbar("fleet")
+                + f'<div class="content">'
+                + f'<div class="grid">{cards}</div>'
+                + f'<p class="section-title">Recent Fleet Events</p>'
+                + f'<div>{events}</div>'
+                + f'<footer>Auto-refreshes every 60s &middot; management VM</footer>'
+                + '</div></body></html>'
+            )
+            self._html(200, page.encode()); return
+
+        if path == "/stats":
+            fleet     = load_json(TOOLS_DIR / "fleet.json") or {"vms": []}
+            fleet_vms = [v.get("name") for v in fleet.get("vms", []) if v.get("name")]
+            vm_name   = qs.get("vm", ["management"])[0]
+            if vm_name not in fleet_vms:
                 vm_name = "management"
-            self._html(200, stats_page(vm_name, fleet_names))
-        else:
-            self._html(200, fleet_page())
+            self._html(200, stats_page(vm_name, fleet_vms)); return
+
+        if path == "/logs":
+            fleet       = load_json(TOOLS_DIR / "fleet.json") or {"vms": []}
+            fleet_vms   = [v.get("name") for v in fleet.get("vms", []) if v.get("name")]
+            vm_name     = qs.get("vm", ["worker"])[0]
+            service_raw = qs.get("service", ["cloud-lab-a1-lottery"])[0]
+            valid_svcs  = {s for s, _ in _LOG_SERVICES}
+            service     = service_raw if service_raw in valid_svcs else "cloud-lab-a1-lottery"
+            if vm_name not in fleet_vms:
+                vm_name = fleet_vms[0] if fleet_vms else "management"
+            self._html(200, logs_page(vm_name, service, fleet_vms)); return
+
+        if path == "/export":
+            self._html(200, export_page()); return
+
+        self._html(404, b"Not found")
 
     def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length) if length else b""
-        path = urlparse(self.path).path.rstrip("/")
+        parsed = urlparse(self.path)
+        path   = parsed.path.rstrip("/") or "/"
+
+        if path == "/heartbeat":
+            length = int(self.headers.get("Content-Length", 0))
+            body   = self.rfile.read(length)
+            try:
+                data = json.loads(body)
+                vm   = str(data.get("vm", ""))[:64]
+                if vm:
+                    now = datetime.now(timezone.utc).isoformat()
+                    with _hb_lock:
+                        existing = _heartbeats.get(vm, {"events": []})
+                        existing["received_at"] = now
+                        existing["uptime"]      = str(data.get("uptime", ""))[:80]
+                        ev = data.get("event")
+                        if ev:
+                            existing.setdefault("events", []).append(
+                                {"received_at": now, "event": str(ev)[:200]}
+                            )
+                            existing["events"] = existing["events"][-50:]
+                        _heartbeats[vm] = existing
+                    save_heartbeats()
+            except Exception:
+                pass
+            self._json(200, {"ok": True}); return
 
         if path == "/login":
-            client_ip = self.client_address[0]
-            if not _check_rate_limit(client_ip):
-                self._html(429, login_page(error=True, locked=True))
-                return
-            params   = parse_qs(body.decode("utf-8", errors="replace"))
-            username = (params.get("username") or [""])[0]
-            password = (params.get("password") or [""])[0]
-            if username == USERNAME and _verify_password(password):
-                _clear_fails(client_ip)
+            length  = int(self.headers.get("Content-Length", 0))
+            body    = self.rfile.read(length).decode("utf-8", errors="replace")
+            fields  = parse_qs(body)
+            uname   = fields.get("username", [""])[0].strip()
+            pw      = fields.get("password", [""])[0]
+            client  = self.client_address[0]
+
+            if not _check_rate_limit(client):
+                self._html(429, login_page(error=True, locked=True)); return
+            if uname == USERNAME and _verify_password(pw):
+                _clear_fails(client)
                 sid = _create_session()
-                self.send_response(302)
-                self.send_header("Location", "/")
-                self.send_header("Set-Cookie",
-                    f"{COOKIE_NAME}={sid}; Path=/; HttpOnly; SameSite=Strict; "
-                    f"Max-Age={SESSION_DURATION}")
-                self.end_headers()
+                self._redirect("/",
+                    f'{COOKIE_NAME}={sid}; Max-Age={SESSION_DURATION}; '
+                    f'Path=/; HttpOnly; SameSite=Strict')
             else:
-                _record_fail(client_ip)
+                _record_fail(client)
                 self._html(401, login_page(error=True))
+            return
 
-        elif path == "/heartbeat":
-            try:
-                data = json.loads(body) if body else {}
-            except Exception:
-                data = {}
-            sender = str(data.get("vm_name", "unknown"))
-            now = datetime.now(timezone.utc).isoformat()
-            with _hb_lock:
-                existing = _heartbeats.get(sender, {})
-                events = list(existing.get("events", []))
-                event = data.get("event")
-                if event:
-                    events.append({
-                        "received_at": now,
-                        "event": str(event),
-                        "details": data.get("details", {}),
-                    })
-                    events = events[-20:]
-                _heartbeats[sender] = {
-                    "received_at": now,
-                    "uptime": str(data.get("uptime", "?")),
-                    "extra": data,
-                    "events": events,
-                }
-            save_heartbeats()
-            self._respond(200, b"ok")
+        self._html(404, b"Not found")
 
-        else:
-            self._respond(404, b"Not found")
+    # ── response helpers ───────────────────────────────────────────────────────
 
-    def _html(self, code: int, body: bytes) -> None:
+    def _html(self, code: int, body: bytes | str) -> None:
+        if isinstance(body, str):
+            body = body.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(body)
 
-    def _respond(self, code: int, body: bytes) -> None:
+    def _json(self, code: int, data: dict) -> None:
+        body = json.dumps(data).encode()
         self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    def log_message(self, format, *args):
-        return
+    def _redirect(self, location: str, set_cookie: str = "") -> None:
+        self.send_response(303)
+        self.send_header("Location", location)
+        if set_cookie:
+            self.send_header("Set-Cookie", set_cookie)
+        self.end_headers()
+
+    def log_message(self, fmt, *args):
+        pass   # suppress per-request access log noise
+
+
+# ── startup ───────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    load_heartbeats()
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    print(f"[admin_console] {FLEET_NAME} — listening on {HOST}:{PORT}", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
-    load_heartbeats()
-    print(f"[admin_console] Listening on {HOST}:{PORT}", flush=True)
-    print(f"[admin_console] Fleet: {FLEET_NAME}", flush=True)
-    print(f"[admin_console] Tools dir: {TOOLS_DIR}", flush=True)
-    if PW_HASH:
-        print(f"[admin_console] Password auth enabled. Username: {USERNAME}", flush=True)
-    else:
-        print("[admin_console] WARNING: ADMIN_PASSWORD_HASH not set — all logins will fail.", flush=True)
-    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
+    main()

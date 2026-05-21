@@ -24,7 +24,7 @@ if [ ! -f /home/ubuntu/.ssh/fleet.key ]; then
         -f /home/ubuntu/.ssh/fleet.key -N "" -C "${FLEET_NAME}-worker-fleet"
 fi
 
-mkdir -p /home/ubuntu/.config/cloud-lab
+install -d -m 755 -o ubuntu -g ubuntu /home/ubuntu/.config/cloud-lab
 cat > /home/ubuntu/.config/cloud-lab/worker.env << 'ENVEOF'
 OCI_AUTH_MODE=instance_principal
 OCI_COMPARTMENT_ID=${OCI_COMPARTMENT_ID}

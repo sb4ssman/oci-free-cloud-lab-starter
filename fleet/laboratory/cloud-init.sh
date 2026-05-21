@@ -18,7 +18,7 @@ CLONE_URL="https://oauth2:${GITHUB_TOKEN}@github.com/${FLEET_REPO}.git"
 sudo -u ubuntu git clone "$CLONE_URL" /home/ubuntu/cloud-lab \
   || sudo -u ubuntu git -C /home/ubuntu/cloud-lab pull --ff-only
 
-mkdir -p /home/ubuntu/.config/cloud-lab
+install -d -m 755 -o ubuntu -g ubuntu /home/ubuntu/.config/cloud-lab
 cat > /home/ubuntu/.config/cloud-lab/laboratory.env << 'ENVEOF'
 OCI_AUTH_MODE=instance_principal
 OCI_COMPARTMENT_ID=${OCI_COMPARTMENT_ID}

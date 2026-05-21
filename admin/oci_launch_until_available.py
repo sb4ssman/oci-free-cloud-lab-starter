@@ -117,13 +117,7 @@ def oci_env(auth_mode: str) -> dict[str, str]:
     return child_env
 
 
-def run_oci(
-    args: list[str],
-    *,
-    auth_mode: str,
-    timeout_seconds: int,
-    heartbeat_seconds: int,
-) -> tuple[int, str, str, bool]:
+def oci_executable() -> str:
     oci = shutil.which("oci")
     if not oci and platform.system() == "Windows":
         known = Path(r"C:\Program Files (x86)\Oracle\oci_cli\oci.exe")
@@ -131,6 +125,34 @@ def run_oci(
             oci = str(known)
     if not oci:
         raise RetryError("OCI CLI was not found on PATH.")
+    return oci
+
+
+def redacted_command(args: list[str]) -> str:
+    safe_args: list[str] = []
+    redact_next = False
+    for arg in args:
+        if redact_next:
+            safe_args.append("***")
+            redact_next = False
+            continue
+        safe_args.append(arg)
+        if arg in {"--auth-purpose", "--security-token-file"}:
+            redact_next = True
+    return "oci " + " ".join(safe_args)
+
+
+def run_oci(
+    args: list[str],
+    *,
+    auth_mode: str,
+    timeout_seconds: int,
+    heartbeat_seconds: int,
+    label: str = "OCI command",
+) -> tuple[int, str, str, bool]:
+    oci = oci_executable()
+    log(f"{label}: using OCI CLI at {oci}")
+    log(f"{label}: running {redacted_command(args)}")
 
     process = subprocess.Popen(
         [oci, *args],
@@ -152,7 +174,7 @@ def run_oci(
         elapsed = int(now - started)
 
         if heartbeat_seconds > 0 and now >= next_heartbeat:
-            log(f"OCI command still running after {elapsed}s (PID {process.pid}); timeout at {timeout_seconds}s.")
+            log(f"{label} still running after {elapsed}s (PID {process.pid}); timeout at {timeout_seconds}s.")
             next_heartbeat = now + heartbeat_seconds
 
         if elapsed >= timeout_seconds:
@@ -164,6 +186,7 @@ def run_oci(
     code = 124 if timed_out else int(process.returncode or 0)
     if timed_out and not stderr:
         stderr = f"Timed out after {timeout_seconds}s: oci {' '.join(args)}"
+    log(f"{label}: completed with exit code {code}.")
     return code, stdout or "", stderr or "", timed_out
 
 
@@ -173,12 +196,14 @@ def run_oci_json(
     auth_mode: str,
     timeout_seconds: int,
     heartbeat_seconds: int,
+    label: str = "OCI command",
 ) -> Any:
     code, stdout, stderr, _ = run_oci(
         args,
         auth_mode=auth_mode,
         timeout_seconds=timeout_seconds,
         heartbeat_seconds=heartbeat_seconds,
+        label=label,
     )
     if code != 0:
         raise RetryError((stdout + " " + stderr).strip())
@@ -195,6 +220,7 @@ def availability_domain(config: dict[str, Any]) -> str:
         auth_mode=config["oci_auth"],
         timeout_seconds=int(config["oci_timeout_seconds"]),
         heartbeat_seconds=int(config["oci_heartbeat_seconds"]),
+        label="Availability-domain lookup",
     )
     names = [item["name"] for item in data.get("data", [])]
     if not names:
@@ -209,6 +235,19 @@ def availability_domain(config: dict[str, Any]) -> str:
         log(f"Configured AD '{configured}' is invalid. Using OCI-discovered AD: {names[0]}")
         return names[0]
     raise RetryError(f"Configured AD '{configured}' is not in OCI's list: {', '.join(names)}")
+
+
+def oci_connectivity_probe(config: dict[str, Any]) -> None:
+    """Make a small authenticated OCI API call so logs show auth/network health."""
+    data = run_oci_json(
+        ["iam", "availability-domain", "list", "--compartment-id", config["compartment_id"]],
+        auth_mode=config["oci_auth"],
+        timeout_seconds=60,
+        heartbeat_seconds=int(config["oci_heartbeat_seconds"]),
+        label="OCI auth/connectivity probe",
+    )
+    count = len(data.get("data", []))
+    log(f"OCI auth/connectivity probe OK ({count} availability domain(s) visible).")
 
 
 def latest_image_id(config: dict[str, Any]) -> str:
@@ -235,6 +274,7 @@ def latest_image_id(config: dict[str, Any]) -> str:
         auth_mode=config["oci_auth"],
         timeout_seconds=int(config["oci_timeout_seconds"]),
         heartbeat_seconds=int(config["oci_heartbeat_seconds"]),
+        label="Image lookup",
     )
     images = data.get("data", [])
     if not images:
@@ -360,24 +400,42 @@ def launch_args(
     return args, temp_files
 
 
+def search_query_literal(value: str) -> str:
+    """Escape a value for OCI structured-search single-quoted string syntax."""
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def resource_search_instance(config: dict[str, Any]) -> dict[str, Any] | None:
+    """Find an instance by display name via OCI Resource Search."""
+    name = config["instance_display_name"]
+    query = f"query instance resources where displayName = '{search_query_literal(name)}'"
+    data = run_oci_json(
+        ["search", "resource", "structured-search",
+         "--query-text", query,
+         "--limit", "20"],
+        auth_mode=config["oci_auth"],
+        timeout_seconds=60,
+        heartbeat_seconds=int(config.get("oci_heartbeat_seconds", 15)),
+        label="Pre-flight resource search",
+    )
+    for item in data.get("data", {}).get("items", []):
+        display_name = item.get("display-name") or item.get("displayName")
+        lifecycle_state = item.get("lifecycle-state") or item.get("lifecycleState") or "UNKNOWN"
+        identifier = item.get("identifier") or item.get("id")
+        if display_name == name and lifecycle_state not in ("TERMINATING", "TERMINATED", "DELETED"):
+            return {
+                "id": identifier,
+                "display-name": display_name,
+                "lifecycle-state": lifecycle_state,
+                "compartment-id": item.get("compartment-id") or item.get("compartmentId"),
+            }
+    return None
+
+
 def find_active_instance(config: dict[str, Any]) -> dict[str, Any] | None:
     """Return an existing non-terminated instance with this display name, if any."""
-    timeout_seconds = max(180, int(config.get("oci_timeout_seconds", 60)))
-    log(f"Pre-flight: checking OCI for existing '{config['instance_display_name']}' "
-        f"(timeout {timeout_seconds}s).")
-    data = run_oci_json(
-        ["compute", "instance", "list",
-         "--compartment-id", config["compartment_id"],
-         "--display-name", config["instance_display_name"]],
-        auth_mode=config["oci_auth"],
-        timeout_seconds=timeout_seconds,
-        heartbeat_seconds=int(config.get("oci_heartbeat_seconds", 15)),
-    )
-    for item in data.get("data", []):
-        if (item.get("display-name") == config["instance_display_name"] and
-                item.get("lifecycle-state") not in ("TERMINATING", "TERMINATED")):
-            return item
-    return None
+    log(f"Pre-flight: searching OCI for existing '{config['instance_display_name']}'.")
+    return resource_search_instance(config)
 
 
 def instance_already_active(config: dict[str, Any]) -> bool:
@@ -417,6 +475,7 @@ def public_ip_for_instance(config: dict[str, Any], instance_id: str) -> str:
         auth_mode=config["oci_auth"],
         timeout_seconds=60,
         heartbeat_seconds=0,
+        label="VNIC attachment lookup",
     ).get("data", [])
     for attachment in attachments:
         vnic_id = attachment.get("vnic-id", "")
@@ -427,6 +486,7 @@ def public_ip_for_instance(config: dict[str, Any], instance_id: str) -> str:
             auth_mode=config["oci_auth"],
             timeout_seconds=60,
             heartbeat_seconds=0,
+            label="VNIC public IP lookup",
         ).get("data", {})
         public_ip = vnic.get("public-ip") or ""
         if public_ip:
@@ -582,6 +642,8 @@ def retry(config: dict[str, Any], env: dict[str, str]) -> int:
     log(f"Retry delay : {config['retry_delay_seconds']}s")
     if config.get("cloud_init_template"):
         log(f"Cloud-init  : {config['cloud_init_template']}")
+
+    oci_connectivity_probe(config)
 
     if instance_already_active(config):
         item = find_active_instance(config)

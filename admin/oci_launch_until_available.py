@@ -352,8 +352,8 @@ def instance_already_active(config: dict[str, Any]) -> bool:
             ["compute", "instance", "list",
              "--compartment-id", config["compartment_id"], "--all"],
             auth_mode=config["oci_auth"],
-            timeout_seconds=int(config["oci_timeout_seconds"]),
-            heartbeat_seconds=int(config["oci_heartbeat_seconds"]),
+            timeout_seconds=30,
+            heartbeat_seconds=0,
         )
         for item in data.get("data", []):
             if (item.get("display-name") == config["instance_display_name"] and
@@ -519,7 +519,12 @@ def retry(config: dict[str, Any], env: dict[str, str]) -> int:
             time.sleep(int(config["retry_delay_seconds"]))
         finally:
             for f in temp_files:
-                f.unlink(missing_ok=True)
+                for _ in range(5):
+                    try:
+                        f.unlink(missing_ok=True)
+                        break
+                    except PermissionError:
+                        time.sleep(0.5)
 
 
 def main() -> int:

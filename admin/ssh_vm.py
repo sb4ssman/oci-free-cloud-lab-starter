@@ -3,9 +3,9 @@
 SSH into a fleet VM by name.
 
 Usage:
-  ssh-vm.bat management          open interactive shell
-  ssh-vm.bat worker              open interactive shell
-  ssh-vm.bat laboratory -- <cmd>     run one command and exit
+  admin/ssh-vm.sh management              open interactive shell from a POSIX shell
+  admin\\ssh-vm.bat management            open interactive shell from Command Prompt or PowerShell
+  admin/ssh-vm.sh laboratory -- <cmd>     run one command and exit
 
 IP resolution order:
   1. OCI_<NAME_SLUG>_HOST in .env  (e.g. OCI_MANAGEMENT_HOST, OCI_LABORATORY_HOST)

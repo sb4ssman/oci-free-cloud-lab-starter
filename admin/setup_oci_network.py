@@ -10,9 +10,10 @@ Safe to re-run — skips resources that already exist.
 Prints the values you need to add to .env when done.
 
 Usage:
-  setup-oci-network.bat
-  setup-oci-network.bat --dry-run   Show what would be created; don't create anything
-  setup-oci-network.bat --iam-only  Only create/update instance-principal IAM
+  admin/setup-oci-network.sh
+  admin\\setup-oci-network.bat
+  ... --dry-run   Show what would be created; don't create anything
+  ... --iam-only  Only create/update instance-principal IAM
 """
 
 from __future__ import annotations
@@ -419,7 +420,7 @@ def main() -> int:
     print(f"OCI_AVAILABILITY_DOMAIN={ad}")
     print()
     if not dry_run:
-        print("Also update your .env file now — then run launch-management.bat.")
+        print("Also update your .env file now — then run launch-management.")
 
     return 0
 

@@ -89,13 +89,14 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 
 ### 3. Create OCI network resources (once)
 
-**Windows:**
-```
-admin\setup-oci-network.bat
-```
-**Mac/Linux:**
+Run the wrapper for your shell from the repo root:
+
 ```bash
 bash admin/setup-oci-network.sh
+```
+
+```powershell
+admin\setup-oci-network.bat
 ```
 
 This creates a VCN, subnet, internet gateway, route table, and security rules. Copy
@@ -103,13 +104,14 @@ the output `OCI_VCN_ID` and `OCI_SUBNET_ID` values into `.env`.
 
 ### 4. Launch the management VM
 
-**Windows:**
-```
-admin\launch-management.bat
-```
-**Mac/Linux:**
+Run the matching wrapper:
+
 ```bash
 bash admin/launch-management.sh
+```
+
+```powershell
+admin\launch-management.bat
 ```
 
 Wait 5–10 minutes for cloud-init to finish. Then:
@@ -122,8 +124,13 @@ Wait 5–10 minutes for cloud-init to finish. Then:
 The fleet orchestrator on the management VM handles everything from here. Check in
 from your machine at any time:
 
-**Windows:** `admin\check-all-vms.bat`
-**Mac/Linux:** `bash admin/check-all-vms.sh`
+```bash
+bash admin/check-all-vms.sh
+```
+
+```powershell
+admin\check-all-vms.bat
+```
 
 Or just watch the admin console — it auto-refreshes every 60 seconds and shows live
 VM state, heartbeat times, uptime, and links to log streams for each background service.
@@ -140,8 +147,9 @@ directly from the browser. It also includes:
 
 ## Admin scripts reference
 
-All scripts are in `admin/`. Run them from the repo root. `.bat` for Windows,
-`.sh` for Mac/Linux — both call the same Python underneath.
+All scripts are in `admin/`. Run them from the repo root. Use the `.sh` wrapper
+from POSIX shells and the `.bat` wrapper from Command Prompt or PowerShell; both
+call the same Python underneath.
 
 | Script | What it does |
 |---|---|
@@ -269,18 +277,20 @@ Let's Encrypt cert. Wait 60 seconds and reload.
 
 **Admin console not loading at all** — check Caddy on the management VM:
 ```bash
-bash admin/ssh-vm.sh management  # or: admin\ssh-vm.bat management (Windows)
+bash admin/ssh-vm.sh management
 sudo systemctl status caddy
 sudo journalctl -u caddy -n 50
 ```
+PowerShell equivalent: `admin\ssh-vm.bat management`
 
 **OCI CLI errors on the management VM** — run `bootstrap-mgmt-vm` to re-apply setup.
 
 **Worker or laboratory stuck as NOT FOUND** — the orchestrator is working on it. Check:
 ```bash
-bash admin/ssh-vm.sh management  # or: admin\ssh-vm.bat management (Windows)
+bash admin/ssh-vm.sh management
 journalctl -u cloud-lab-orchestrator -f
 ```
+PowerShell equivalent: `admin\ssh-vm.bat management`
 
 **A1 Flex launch keeps failing** — completely normal. `Out of host capacity` is
 Oracle's queue, not an error you can fix. The orchestrator is retrying. Check progress

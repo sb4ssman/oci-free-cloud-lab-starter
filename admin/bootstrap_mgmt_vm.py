@@ -9,8 +9,9 @@ Reads .env, builds the setup script with values substituted, SSHes into the
 management VM, and pipes it through bash.
 
 Usage:
-  bootstrap-mgmt-vm.bat            Run full setup
-  bootstrap-mgmt-vm.bat --dry-run  Print the script that would run; don't connect
+  admin/bootstrap-mgmt-vm.sh            Run full setup from a POSIX shell
+  admin\\bootstrap-mgmt-vm.bat          Run full setup from Command Prompt or PowerShell
+  ... --dry-run                         Print the script that would run; don't connect
 """
 
 from __future__ import annotations

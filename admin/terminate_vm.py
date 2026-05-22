@@ -6,9 +6,10 @@ Reads instance OCIDs from vm-profiles/, calls OCI CLI to terminate,
 and removes the profile file on success.
 
 Usage:
-  terminate-vm.bat                 List running VMs and prompt which to terminate
-  terminate-vm.bat management      Terminate a specific VM (still prompts to confirm)
-  terminate-vm.bat worker --yes    Skip confirmation prompt
+  admin/terminate-vm.sh                 List running VMs and prompt which to terminate
+  admin\\terminate-vm.bat               Same command from Command Prompt or PowerShell
+  admin/terminate-vm.sh management      Terminate a specific VM (still prompts to confirm)
+  admin/terminate-vm.sh worker --yes    Skip confirmation prompt
 """
 
 from __future__ import annotations

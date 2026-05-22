@@ -9,6 +9,7 @@ Endpoints:
   POST /login               Validate credentials, set session cookie, redirect to /
   GET  /logout              Clear session, redirect to /login
   POST /heartbeat           Liveness pings from worker/laboratory (Bearer token if configured)
+  GET  /health              Liveness probe for UptimeRobot (no auth, JSON response)
   GET  /export              Fleet connection details (login required)
   GET  /stats?vm=<name>     Live system stats (login required)
   GET  /logs?vm=<name>&service=<svc>  Journalctl logs (login required)
@@ -1592,6 +1593,16 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/audit":
             self._html(200, audit_page()); return
+
+        if path == "/health":
+            # Lightweight liveness probe for UptimeRobot / external monitors. No auth.
+            body_out = json.dumps({"status": "ok", "ts": int(time.time())}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body_out)))
+            self.end_headers()
+            self.wfile.write(body_out)
+            return
 
         self._html(404, b"Not found")
 

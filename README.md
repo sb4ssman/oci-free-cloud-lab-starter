@@ -48,11 +48,16 @@ Complete all of these before running anything.
       `ssh-keygen -t ed25519 -f ~/.ssh/fleet.key`
 - [ ] **DuckDNS account + subdomain** — free at [duckdns.org](https://www.duckdns.org/).
       You need this hostname for the admin console's HTTPS certificate.
-- [ ] **ntfy topic name** — free at [ntfy.sh](https://ntfy.sh/). Pick any unique string;
-      this is how the fleet notifies you. (Optional but strongly recommended.)
+- [ ] **ntfy topic name** *(optional but strongly recommended)* — free at [ntfy.sh](https://ntfy.sh/).
+      Pick any unique string; the fleet sends alerts directly to ntfy when management is
+      unreachable. Leave blank in `.env` to disable.
 - [ ] **GitHub account** — fork this repo so VMs can clone your copy.
       Public forks can leave `GITHUB_TOKEN` blank. Private forks need a fine-grained,
       read-only token limited to this repository.
+- [ ] **UptimeRobot account** *(optional)* — free at [uptimerobot.com](https://uptimerobot.com/).
+      Create an HTTPS monitor targeting `https://your-domain.duckdns.org/health` and add a
+      webhook alert to `https://ntfy.sh/<your-topic>`. This is the external watchdog — the
+      only layer that fires even if all three VMs go down simultaneously.
 
 ---
 
@@ -190,8 +195,9 @@ as a TLS-terminating reverse proxy in front of the admin console.
 | TLS cert provisioning via Caddy + Let's Encrypt | Fill in `OCI_*_HOST` in `.env` as VMs come online |
 | Peer health monitoring across all VMs | Wait for A1 Flex capacity (hours to days — out of your hands) |
 | A1 Flex retry loop until capacity granted | — |
-| Self-healing: relaunch terminated VMs | — |
-| Self-healing: worker relaunches management if it goes down | — |
+| Self-healing: management relaunches worker and laboratory | — |
+| Self-healing: worker relaunches management (and lab if management is also gone) | — |
+| Self-healing: laboratory relaunches management when both mgmt + worker are down | — |
 | Keepalive: periodic CPU activity to prevent idle reclamation | — |
 | Resource alerts: ntfy if disk >80%, RAM <10%, or load spikes | — |
 

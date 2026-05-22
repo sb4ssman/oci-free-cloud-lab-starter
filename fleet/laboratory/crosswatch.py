@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""laboratory cross-watch — runs as a systemd timer on the laboratory VM.
+"""Laboratory cross-watch — runs as a systemd timer on the laboratory VM.
 Checks OCI state of peer VMs every 6 hours.
 
 Normal peers: reports anomalies to the management heartbeat endpoint.
-Management down: sends ntfy directly, then defers any relaunch to the worker
-  VM (which has the relaunch logic). If worker is also down, sends an urgent
-  ntfy and waits for human intervention.
+Management down + worker RUNNING: sends ntfy directly, defers relaunch to worker.
+Management down + worker ALSO down: laboratory takes over — attempts management
+  relaunch directly. After management is up, management's orchestrator handles
+  relaunching worker.
+Worker down + management RUNNING: reports to management (orchestrator handles it).
+Worker down + management ALSO down + management relaunch exhausted: laboratory
+  attempts worker relaunch directly as a last resort.
 
 IP re-discovery (Option B): management's current private IP is always resolved
 from OCI at crosswatch time, not from the potentially-stale env file. The env
@@ -18,12 +22,17 @@ import json
 import os
 import shutil
 import subprocess
+import sys
+import time
 import urllib.request
 from pathlib import Path
 
 
 TOOLS_DIR = Path(__file__).resolve().parent.parent.parent   # repo root
 ENV_FILE  = Path.home() / ".config" / "cloud-lab" / "laboratory.env"
+
+_PEER_MAX_ATTEMPTS = 3
+_PEER_COOLDOWN     = 15 * 60   # seconds between relaunch attempts
 
 
 # ── env parsing ───────────────────────────────────────────────────────────────
@@ -139,7 +148,8 @@ def notify_ntfy(topic: str, title: str, message: str, priority: str = "high") ->
         print(f"[crosswatch] ntfy failed: {exc}", flush=True)
 
 
-def report_to_management(mgmt_ip: str, vm_name: str, event: str, details: dict, heartbeat_token: str = "") -> None:
+def report_to_management(mgmt_ip: str, vm_name: str, event: str, details: dict,
+                         heartbeat_token: str = "") -> None:
     if not mgmt_ip:
         print("[crosswatch] no management IP — cannot report event.", flush=True)
         return
@@ -149,10 +159,10 @@ def report_to_management(mgmt_ip: str, vm_name: str, event: str, details: dict, 
         "event": event,
         "details": details,
     }).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if heartbeat_token:
+        headers["Authorization"] = f"Bearer {heartbeat_token}"
     try:
-        headers = {"Content-Type": "application/json"}
-        if heartbeat_token:
-            headers["Authorization"] = f"Bearer {heartbeat_token}"
         req = urllib.request.Request(
             f"http://{mgmt_ip}:8765/heartbeat",
             data=payload,
@@ -176,15 +186,99 @@ def trigger_heartbeat() -> None:
         print(f"[crosswatch] Failed to trigger heartbeat: {exc}", flush=True)
 
 
+# ── peer relaunch ─────────────────────────────────────────────────────────────
+
+def _state_file_for(target: str) -> Path:
+    return Path.home() / "cloud-lab" / "logs" / f"{target}-relaunch.json"
+
+
+def _load_relaunch_state(target: str) -> dict:
+    sf = _state_file_for(target)
+    if sf.exists():
+        try:
+            return json.loads(sf.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {"attempts": 0, "last_attempt_ts": 0.0}
+
+
+def _save_relaunch_state(target: str, state: dict) -> None:
+    sf = _state_file_for(target)
+    sf.parent.mkdir(parents=True, exist_ok=True)
+    sf.write_text(json.dumps(state), encoding="utf-8")
+
+
+def attempt_peer_relaunch(target: str, ntfy_topic: str) -> bool:
+    """Launch any peer VM via oci_launch_until_available.py + its profile JSON.
+    target: VM name matching a profile in admin/profiles/<target>.json
+    Tracks attempt count and cooldown per target in a state file.
+    Returns True if a launch was attempted (not necessarily successful).
+    """
+    state = _load_relaunch_state(target)
+    now = time.time()
+
+    if state["attempts"] >= _PEER_MAX_ATTEMPTS:
+        print(f"[crosswatch] {target} relaunch: max attempts reached.", flush=True)
+        return False
+
+    elapsed = now - state["last_attempt_ts"]
+    if elapsed < _PEER_COOLDOWN:
+        remaining = int(_PEER_COOLDOWN - elapsed)
+        print(f"[crosswatch] {target} relaunch: cooldown active ({remaining}s left).", flush=True)
+        return False
+
+    attempt_n = state["attempts"] + 1
+    print(f"[crosswatch] Attempting {target} relaunch ({attempt_n}/{_PEER_MAX_ATTEMPTS})...", flush=True)
+    notify_ntfy(
+        ntfy_topic,
+        f"[cloud-lab] {target.capitalize()} relaunch attempt {attempt_n}/{_PEER_MAX_ATTEMPTS}",
+        f"Laboratory is attempting to relaunch the {target} VM via OCI.",
+        priority="default",
+    )
+
+    state["attempts"] = attempt_n
+    state["last_attempt_ts"] = now
+    _save_relaunch_state(target, state)
+
+    launcher = TOOLS_DIR / "admin" / "oci_launch_until_available.py"
+    profile  = TOOLS_DIR / "admin" / "profiles" / f"{target}.json"
+
+    child_env = os.environ.copy()
+    child_env["OCI_CLI_AUTH"] = "instance_principal"
+    child_env["OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING"] = "True"
+    child_env["OCI_AUTH_MODE"] = "instance_principal"
+    child_env["OCI_OPEN_CONSOLE_ON_SUCCESS"] = "false"
+
+    try:
+        result = subprocess.run(
+            [sys.executable, str(launcher),
+             "--profile", str(profile),
+             "--env", str(ENV_FILE)],
+            timeout=300,
+            env=child_env,
+        )
+        if result.returncode == 0:
+            print(f"[crosswatch] {target} relaunch succeeded.", flush=True)
+            _save_relaunch_state(target, {"attempts": 0, "last_attempt_ts": 0.0})
+            return True
+        print(f"[crosswatch] {target} relaunch exited {result.returncode}.", flush=True)
+    except subprocess.TimeoutExpired:
+        print(f"[crosswatch] {target} relaunch timed out (5 min) — will retry next cycle.", flush=True)
+    except Exception as exc:
+        print(f"[crosswatch] {target} relaunch error: {exc}", flush=True)
+
+    return False
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     env = parse_env_file(ENV_FILE)
     env.update(os.environ)
 
-    compartment_id = env.get("OCI_COMPARTMENT_ID", "")
-    ntfy_topic     = env.get("NOTIFY_NTFY_TOPIC", "")
-    this_vm        = env.get("FLEET_VM_NAME", "laboratory")
+    compartment_id  = env.get("OCI_COMPARTMENT_ID", "")
+    ntfy_topic      = env.get("NOTIFY_NTFY_TOPIC", "")
+    this_vm         = env.get("FLEET_VM_NAME", "laboratory")
     heartbeat_token = env.get("FLEET_HEARTBEAT_TOKEN", "")
 
     if not compartment_id:
@@ -218,6 +312,8 @@ def main() -> None:
     else:
         mgmt_ip = ""
 
+    mgmt_down = mgmt_state not in ("RUNNING", "STARTING", "PROVISIONING")
+
     for vm in fleet:
         name = vm["name"]
         if name == this_vm:
@@ -233,11 +329,12 @@ def main() -> None:
             continue
 
         if name == "management":
-            # Management is down — notify directly and let the worker handle relaunch.
             worker_info  = instances.get("worker", {})
             worker_state = worker_info.get("state", "NOT FOUND")
+            worker_up    = worker_state in ("RUNNING", "STARTING", "PROVISIONING")
 
-            if worker_state in ("RUNNING", "STARTING", "PROVISIONING"):
+            if worker_up:
+                # Worker is responsible for management relaunch — lab just notifies.
                 notify_ntfy(
                     ntfy_topic,
                     f"[cloud-lab] Management VM down ({state})",
@@ -245,16 +342,81 @@ def main() -> None:
                     f"Worker is {worker_state} and will attempt relaunch.",
                 )
             else:
-                # Both management and worker are down — only lab is left.
+                # Both management AND worker are down — laboratory is the last node standing.
                 notify_ntfy(
                     ntfy_topic,
-                    "[cloud-lab] Management AND worker down — human needed",
+                    f"[cloud-lab] Management AND worker down — lab taking over",
                     f"Laboratory detected management is {state} and worker is {worker_state}. "
-                    "No automatic recovery possible. Manual intervention required.",
+                    "Attempting management relaunch. Management will then relaunch worker.",
                     priority="urgent",
                 )
+                relaunched = attempt_peer_relaunch("management", ntfy_topic)
+                if relaunched:
+                    # Give cloud-init time to start, then discover the new private IP.
+                    time.sleep(30)
+                    try:
+                        new_instances = oci_instance_states(compartment_id)
+                    except Exception:
+                        new_instances = {}
+                    new_info = new_instances.get("management", {})
+                    new_ip = oci_private_ip(compartment_id, new_info.get("id", ""))
+                    if new_ip:
+                        update_env_value(ENV_FILE, "FLEET_MANAGEMENT_PRIVATE_IP", new_ip)
+                        trigger_heartbeat()
+                        notify_ntfy(
+                            ntfy_topic,
+                            "[cloud-lab] Management relaunched by laboratory",
+                            f"Management is back at {new_ip}. It will now relaunch worker.",
+                            priority="default",
+                        )
+                    else:
+                        notify_ntfy(
+                            ntfy_topic,
+                            "[cloud-lab] Management relaunched — IP pending",
+                            "Management launched but private IP not yet visible. Will update next cycle.",
+                            priority="default",
+                        )
+                else:
+                    mgmt_rs = _load_relaunch_state("management")
+                    if mgmt_rs["attempts"] >= _PEER_MAX_ATTEMPTS:
+                        notify_ntfy(
+                            ntfy_topic,
+                            "[cloud-lab] Full triangle recovery failed — human needed",
+                            f"Management relaunch failed after {_PEER_MAX_ATTEMPTS} attempts "
+                            "and worker is also down. Manual intervention required.",
+                            priority="urgent",
+                        )
+
+        elif name == "worker":
+            if mgmt_down:
+                # Management is also down — check if we've exhausted management relaunch attempts.
+                mgmt_rs = _load_relaunch_state("management")
+                if mgmt_rs["attempts"] >= _PEER_MAX_ATTEMPTS:
+                    # Management recovery failed — attempt worker relaunch directly as last resort.
+                    notify_ntfy(
+                        ntfy_topic,
+                        "[cloud-lab] Relaunching worker — management recovery exhausted",
+                        "Laboratory attempting direct worker relaunch since management is unrecoverable.",
+                    )
+                    attempt_peer_relaunch("worker", ntfy_topic)
+                else:
+                    # Management relaunch still active — once management is up it relaunches worker.
+                    print(
+                        "[crosswatch] worker down, management relaunch in progress; "
+                        "deferring worker relaunch.", flush=True
+                    )
+            else:
+                # Management is up — report to management (its orchestrator handles worker).
+                report_to_management(
+                    mgmt_ip,
+                    this_vm,
+                    "peer_unhealthy",
+                    {"peer": name, "state": state, "expected": "RUNNING"},
+                    heartbeat_token,
+                )
+
         else:
-            # Non-management peer is down — report to management if reachable.
+            # Any other peer — report to management if reachable.
             report_to_management(
                 mgmt_ip,
                 this_vm,

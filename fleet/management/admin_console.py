@@ -21,6 +21,7 @@ import hashlib
 import html
 import json
 import os
+import re
 import secrets
 import shlex
 import shutil
@@ -44,6 +45,8 @@ TOOLS_DIR  = Path(os.getenv("CLOUD_LAB_DIR",
              str(Path.home() / "cloud-lab"))).expanduser()
 PROFILE_DIR     = TOOLS_DIR / "vm-profiles"
 HEARTBEATS_FILE = TOOLS_DIR / "vm-profiles" / "_heartbeats.json"
+AUDIT_LOG        = TOOLS_DIR / "logs" / "audit.jsonl"
+QUEUE_API_KEY    = os.getenv("QUEUE_API_KEY", "")
 
 COOKIE_NAME      = "fleet_session"
 SESSION_DURATION = 7 * 24 * 3600   # 7 days
@@ -56,6 +59,10 @@ _hb_lock = threading.Lock()
 
 _last_oci_snap: float = 0.0
 _SNAP_TTL: float = 300.0   # seconds between OCI API refreshes
+
+_quota_cache: dict = {}
+_quota_cache_ts: float = 0.0
+_QUOTA_TTL: float = 3600.0  # quota refreshes every hour
 
 _login_fails: dict[str, tuple[int, float]] = {}
 _fails_lock  = threading.Lock()
@@ -250,6 +257,7 @@ def refresh_oci_snapshots() -> None:
         }
         (PROFILE_DIR / f"{name}.json").write_text(
             json.dumps(snapshot, indent=2, sort_keys=True), encoding="utf-8")
+    _update_quota_cache()
 
 
 # ── live stats & logs ─────────────────────────────────────────────────────────
@@ -365,6 +373,161 @@ def fleet_events_html() -> str:
         )
     return "\n".join(rows)
 
+
+# ── quota, TLS, DuckDNS, audit, service-control, queue helpers ────────────────
+
+def _is_api_authed(handler: "BaseHTTPRequestHandler") -> bool:
+    """Accept session cookie OR Bearer token for API endpoints."""
+    if _is_authed(handler):
+        return True
+    if QUEUE_API_KEY:
+        auth = handler.headers.get("Authorization", "")
+        if auth.startswith("Bearer ") and auth[7:].strip() == QUEUE_API_KEY:
+            return True
+    return False
+
+
+def _write_audit(action: str, vm: str, details: str,
+                 handler: "BaseHTTPRequestHandler | None" = None) -> None:
+    AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "ts":     datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "action": action,
+        "vm":     vm,
+        "details": details,
+        "ip":     handler.client_address[0] if handler else "local",
+    }
+    with AUDIT_LOG.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry) + "\n")
+
+
+def _mgmt_tls_html() -> str:
+    """Return HTML rows for TLS cert expiry and DuckDNS status (management card only)."""
+    import subprocess as _sp, datetime as _dt
+    rows = []
+    cert_root = Path.home() / ".local" / "share" / "caddy" / "certificates"
+    cert_file: Path | None = None
+    if cert_root.exists():
+        for crt in sorted(cert_root.rglob("*.crt"), key=lambda p: p.stat().st_mtime, reverse=True):
+            cert_file = crt; break
+    if cert_file:
+        try:
+            out  = _sp.check_output(["openssl", "x509", "-enddate", "-noout", "-in", str(cert_file)],
+                                    text=True, stderr=_sp.DEVNULL, timeout=5).strip()
+            date_str = out.split("=", 1)[1].strip()
+            exp  = _dt.datetime.strptime(date_str, "%b %d %H:%M:%S %Y %Z").replace(tzinfo=_dt.timezone.utc)
+            days = (exp - _dt.datetime.now(_dt.timezone.utc)).days
+            cls  = "warn-text" if days < 14 else ""
+            rows.append(f'<p class="{cls}"><b>TLS cert:</b> expires in {days}d ({exp.strftime("%Y-%m-%d")})</p>')
+        except Exception:
+            rows.append('<p class="muted"><b>TLS cert:</b> unable to read</p>')
+    else:
+        rows.append('<p class="muted"><b>TLS cert:</b> not configured</p>')
+    for log_path in [TOOLS_DIR / "logs" / "duckdns.log",
+                     Path.home() / ".config" / "cloud-lab" / "duckdns.log"]:
+        if log_path.exists():
+            try:
+                last = log_path.read_text(encoding="utf-8").strip().splitlines()[-1]
+                rows.append(f'<p class="muted"><b>DuckDNS:</b> {html.escape(last[:80])}</p>')
+            except Exception:
+                pass
+            break
+    return "".join(rows)
+
+
+def _update_quota_cache() -> None:
+    global _quota_cache, _quota_cache_ts
+    import time as _t
+    now = _t.monotonic()
+    if now - _quota_cache_ts < _QUOTA_TTL:
+        return
+    env = _mgmt_env()
+    compartment_id = env.get("OCI_COMPARTMENT_ID", "")
+    if not compartment_id:
+        return
+    limits = {}
+    for limit_name, label in [
+        ("standard-e2-micro-count",   "E2.Micro VMs"),
+        ("standard-a1-ocpus",         "A1 OCPUs"),
+        ("standard-a1-memory-in-gbs", "A1 RAM (GB)"),
+    ]:
+        try:
+            data = oci_cmd(["limits", "resource-availability", "get",
+                            "--compartment-id", compartment_id,
+                            "--service-name", "compute",
+                            "--limit-name", limit_name], timeout=30).get("data", {})
+            limits[label] = {"used": data.get("used","?"), "quota": data.get("effective-quota-value","?")}
+        except Exception:
+            limits[label] = {"used": "?", "quota": "?"}
+    _quota_cache    = limits
+    _quota_cache_ts = now
+
+
+def _quota_html() -> str:
+    if not _quota_cache:
+        return ('<span class="muted" style="font-size:13px">Quota unavailable '
+                '(OCI_COMPARTMENT_ID not set or OCI unreachable)</span>')
+    parts = []
+    for label, vals in _quota_cache.items():
+        parts.append(
+            f'<div class="quota-item"><span class="quota-label">{html.escape(label)}</span>'
+            f'<span class="quota-val">{html.escape(str(vals.get("used","?")))}'
+            f'<span style="font-size:13px;font-weight:400;color:var(--c-muted)"> / {html.escape(str(vals.get("quota","?")))}</span>'
+            f'</span></div>'
+        )
+    return "".join(parts)
+
+
+def _read_vm_queue(vm_name: str) -> list[dict]:
+    if vm_name == "management":
+        p = TOOLS_DIR / "queue.json"
+        try: return json.loads(p.read_text(encoding="utf-8"))
+        except Exception: return []
+    raw = _ssh_run(vm_name, "cat ~/cloud-lab/queue.json 2>/dev/null || echo '[]'", timeout=10)
+    try: return json.loads(raw)
+    except Exception: return []
+
+
+def _read_vm_crontab(vm_name: str) -> str:
+    if vm_name == "management":
+        try:
+            result = subprocess.run(["crontab", "-l"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=5)
+            return result.stdout or "(no crontab)"
+        except Exception as exc: return f"Error: {exc}"
+    return _ssh_run(vm_name, "crontab -l 2>&1 || echo '(no crontab)'", timeout=10)
+
+
+def _svc_chip(name: str, svc: str, label: str) -> str:
+    vm_h  = html.escape(name)
+    svc_h = html.escape(svc)
+    lbl_h = html.escape(label)
+    return (
+        f'<div class="svc-chip-row">'
+        f'<a class="svc-chip" href="/logs?vm={vm_h}&service={svc_h}">{lbl_h}</a>'
+        f'<button class="svc-ctl" title="restart" data-vm="{vm_h}" data-svc="{svc_h}"'
+        f' onclick="svcCtl(this.dataset.vm,this.dataset.svc,&apos;restart&apos;)">&#x21BA;</button>'
+        f'<button class="svc-ctl stop" title="stop" data-vm="{vm_h}" data-svc="{svc_h}"'
+        f' onclick="svcCtl(this.dataset.vm,this.dataset.svc,&apos;stop&apos;)">&#x25A0;</button>'
+        f'<button class="svc-ctl" title="start" data-vm="{vm_h}" data-svc="{svc_h}"'
+        f' onclick="svcCtl(this.dataset.vm,this.dataset.svc,&apos;start&apos;)">&#x25BA;</button>'
+        f'</div>'
+    )
+
+
+def _run_service_control(vm_name: str, service: str, action: str) -> tuple[int, str]:
+    safe_svc = service if re.match(r"^cloud-lab-[a-z0-9_-]+$", service) else ""
+    if not safe_svc: return 1, f"Disallowed service name: {service!r}"
+    safe_action = action if action in ("start", "stop", "restart", "status") else ""
+    if not safe_action: return 1, f"Disallowed action: {action!r}"
+    cmd = f"sudo systemctl {safe_action} {safe_svc} 2>&1; sudo systemctl status {safe_svc} --no-pager 2>&1 | head -20"
+    if vm_name == "management":
+        try:
+            result = subprocess.run(["bash", "-c", cmd],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15)
+            return result.returncode, result.stdout or "(no output)"
+        except Exception as exc: return 1, f"Error: {exc}"
+    return 0, _ssh_run(vm_name, cmd, timeout=20)
 
 # ── CSS / JS constants ────────────────────────────────────────────────────────
 
@@ -562,6 +725,42 @@ footer { text-align: center; font-size: 12px; color: var(--c-muted); padding: 20
                background: var(--c-bg); border: 1px solid var(--c-border); color: var(--c-text);
                transition: background .12s; }
 .svc-chip:hover { background: var(--c-accent); color: #1a1a1a; border-color: var(--c-accent); }
+.svc-chip-row  { display: flex; align-items: center; gap: 3px; }
+.svc-ctl { font-size: 10px; padding: 1px 5px; border-radius: 4px; border: 1px solid var(--c-border);
+           background: var(--c-bg); color: var(--c-muted); cursor: pointer; line-height: 1.5;
+           transition: background .12s, color .12s; }
+.svc-ctl:hover { background: var(--c-primary); color: #fff; border-color: var(--c-primary); }
+.svc-ctl.stop:hover { background: #dc2626; border-color: #dc2626; }
+
+/* queue page */
+.q-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
+.q-table th { text-align: left; padding: 6px 10px; border-bottom: 2px solid var(--c-border);
+              font-size: 11px; color: var(--c-muted); text-transform: uppercase; }
+.q-table td { padding: 6px 10px; border-bottom: 1px solid var(--c-border); vertical-align: top; }
+.q-table tr:hover td { background: var(--c-bg); }
+.q-output   { font-family: monospace; font-size: 11px; max-height: 80px; overflow-y: auto;
+              white-space: pre-wrap; color: var(--c-muted); }
+.badge-pending  { background: #6b7280; color:#fff; }
+.badge-running  { background: #d97706; color:#fff; }
+.badge-done     { background: #16a34a; color:#fff; }
+.badge-failed   { background: #dc2626; color:#fff; }
+
+/* audit log page */
+.audit-row { display: flex; gap: 10px; align-items: baseline; padding: 6px 0;
+             border-bottom: 1px solid var(--c-border); font-size: 12px; }
+.audit-ts   { color: var(--c-muted); white-space: nowrap; min-width: 120px; }
+.audit-who  { font-weight: 600; min-width: 60px; }
+.audit-act  { color: var(--c-primary); min-width: 120px; }
+.audit-vm   { color: var(--c-muted); min-width: 80px; }
+.audit-det  { flex: 1; color: var(--c-muted); font-family: monospace; }
+
+/* quota display */
+.quota-grid { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 6px; }
+.quota-item { background: var(--c-card); border: 1px solid var(--c-border); border-radius: 8px;
+              padding: 8px 14px; font-size: 13px; }
+.quota-label { font-size: 11px; color: var(--c-muted); font-weight: 600; display: block;
+               text-transform: uppercase; letter-spacing: .4px; }
+.quota-val   { font-size: 18px; font-weight: 700; }
 
 /* tools page */
 .tools-grid   { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit,minmax(280px,1fr)); margin-top: 16px; }
@@ -663,6 +862,18 @@ function applyCustomPalette() {
     localStorage.setItem('fleet-logo', logo);
   }
   document.querySelectorAll('.palette-btn').forEach(function(b) { b.classList.remove('active'); });
+}
+
+async function svcCtl(vm, svc, action) {
+  if (!confirm(action + " " + svc + " on " + vm + "?")) return;
+  var r;
+  try {
+    r = await fetch("/service-control", {method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({vm: vm, service: svc, action: action})});
+  } catch(e) { alert("Request failed: " + e); return; }
+  var d = await r.json();
+  alert((d.output || d.error || "Done").trim());
 }
 
 function copyText(text, btn) {
@@ -767,7 +978,9 @@ def _topbar(active: str = "") -> str:
         ("Stats",  "/stats",  "stats"),
         ("Logs",   "/logs",   "logs"),
         ("Tools",  "/tools",  "tools"),
+        ("Queue",  "/queue",  "queue"),
         ("Export", "/export", "export"),
+        ("Audit",  "/audit",  "audit"),
     ]
     links = " ".join(
         f'<a href="{href}" {_ACT if active == key else ""}>{label}</a>'
@@ -890,8 +1103,7 @@ def vm_cards() -> str:
         svcs = _ROLE_SERVICES.get(role, [])
         if svcs:
             chip_links = "".join(
-                f'<a class="svc-chip" href="/logs?vm={html.escape(name)}&service={html.escape(svc_id)}">'
-                f'{html.escape(svc_lbl)}</a>'
+                _svc_chip(name, svc_id, svc_lbl)
                 for svc_id, svc_lbl in svcs
             )
             svc_html = (
@@ -915,6 +1127,7 @@ def vm_cards() -> str:
             f'<p><b>Public IP:</b> {public_ip}</p>'
             f'<p><b>Private IP:</b> {private_ip}</p>'
             f'<p><b>OCI snapshot:</b> {html.escape(snap_ago)}</p>'
+            + (_mgmt_tls_html() if name == 'management' else '')
             + (f'<p><b>Heartbeat:</b> {hb_ago}</p>' if hb_ago else "")
             + f'<div class="card-actions">{"".join(actions)}</div>'
             + svc_html
@@ -946,7 +1159,10 @@ def stats_page(vm_name: str, fleet_vms: list) -> bytes:
         + '<label><input type="checkbox" onchange="(function(cb){'
         + 'if(cb.checked){window._ar=setInterval(()=>location.reload(),10000)}'
         + 'else{clearInterval(window._ar)}})(this)"> Auto-refresh 10s</label>'
-        + '</div></div></body></html>'
+        + '</div>'
+        + f'<p class="section-title">Scheduled Tasks (crontab)</p>'
+        + f'<pre>{html.escape(_read_vm_crontab(vm_name))}</pre>'
+        + '</div></body></html>'
     )
     return page.encode("utf-8")
 
@@ -1186,6 +1402,91 @@ def tools_page(preselect_vm: str = "") -> bytes:
     return page.encode("utf-8")
 
 
+# ── queue page ────────────────────────────────────────────────────────────────
+
+def queue_page(fleet_vms: list) -> bytes:
+    title = f"{FLEET_NAME} — Job Queue"
+    sections = []
+    for vm in fleet_vms:
+        jobs = _read_vm_queue(vm)
+        if not jobs:
+            rows_html = '<p class="muted">No jobs.</p>'
+        else:
+            rows = []
+            for j in jobs:
+                st  = j.get("status", "?")
+                out = html.escape((j.get("output") or "")[:300])
+                rows.append(
+                    f'<tr>'
+                    f'<td><span class="badge badge-{html.escape(st)}">{html.escape(st)}</span></td>'
+                    f'<td>{html.escape(j.get("label","?"))}</td>'
+                    f'<td class="muted">{html.escape(str(j.get("priority","?")))}</td>'
+                    f'<td class="muted">{html.escape(j.get("queued_at","")[:16])}</td>'
+                    f'<td class="muted">{html.escape(j.get("completed_at","")[:16])}</td>'
+                    f'<td><div class="q-output">{out}</div></td>'
+                    f'</tr>'
+                )
+            rows_html = (
+                '<table class="q-table"><thead><tr>'
+                '<th>Status</th><th>Label</th><th>Pri</th>'
+                '<th>Queued</th><th>Done</th><th>Output</th>'
+                '</tr></thead><tbody>' + "".join(rows) + '</tbody></table>'
+            )
+        sections.append(f'<p class="section-title">{html.escape(vm)}</p>' + rows_html)
+    page = (
+        _head(title)
+        + _topbar("queue")
+        + '<div class="content">'
+        + '<p style="font-size:13px;color:var(--c-muted);margin:0 0 16px">'
+        + 'Job queue status across all fleet VMs. Jobs run every 60 s via systemd timer. '
+        + 'Enqueue via <code>POST /enqueue</code> or on each VM with '
+        + '<code>python3 ~/cloud-lab/payload/queue/queue_runner.py --enqueue --label \'X\' --command \'bash -c ...\'</code>.'
+        + '</p>'
+        + "".join(sections)
+        + '</div></body></html>'
+    )
+    return page.encode("utf-8")
+
+
+# ── audit log page ─────────────────────────────────────────────────────────────
+
+def audit_page() -> bytes:
+    title   = f"{FLEET_NAME} — Audit Log"
+    entries: list[dict] = []
+    if AUDIT_LOG.exists():
+        try:
+            lines = AUDIT_LOG.read_text(encoding="utf-8").strip().splitlines()
+            for line in lines[-200:]:
+                try: entries.append(json.loads(line))
+                except Exception: pass
+        except Exception:
+            pass
+    entries.reverse()
+    if not entries:
+        body = '<p class="muted">No audit entries yet.</p>'
+    else:
+        rows = []
+        for e in entries:
+            rows.append(
+                f'<div class="audit-row">'
+                f'<span class="audit-ts">{html.escape(e.get("ts","")[:16])}</span>'
+                f'<span class="audit-who">{html.escape(e.get("ip","?"))}</span>'
+                f'<span class="audit-act">{html.escape(e.get("action","?"))}</span>'
+                f'<span class="audit-vm">{html.escape(e.get("vm","—"))}</span>'
+                f'<span class="audit-det">{html.escape(e.get("details",""))}</span>'
+                f'</div>'
+            )
+        body = "".join(rows)
+    page = (
+        _head(title)
+        + _topbar("audit")
+        + '<div class="content">'
+        + '<p style="font-size:13px;color:var(--c-muted);margin:0 0 16px">'
+        + 'All tool runs, service control actions, and queue enqueue events. Last 200 entries, newest first.'
+        + '</p>' + body + '</div></body></html>'
+    )
+    return page.encode("utf-8")
+
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
 class Handler(BaseHTTPRequestHandler):
@@ -1214,6 +1515,8 @@ class Handler(BaseHTTPRequestHandler):
                 + _topbar("fleet")
                 + f'<div class="content">'
                 + f'<div class="grid">{cards}</div>'
+                + f'<p class="section-title">Oracle Free Tier Quota</p>'
+                + f'<div class="quota-grid">{_quota_html()}</div>'
                 + f'<p class="section-title">Recent Fleet Events</p>'
                 + f'<div>{events}</div>'
                 + f'<footer>Auto-refreshes every 60s &middot; management VM</footer>'
@@ -1247,6 +1550,14 @@ class Handler(BaseHTTPRequestHandler):
             preselect = qs.get("vm", [""])[0]
             self._html(200, tools_page(preselect)); return
 
+        if path == "/queue":
+            fleet     = load_json(TOOLS_DIR / "fleet.json") or {"vms": []}
+            names     = [v.get("name") for v in fleet.get("vms", []) if v.get("name")]
+            self._html(200, queue_page(names)); return
+
+        if path == "/audit":
+            self._html(200, audit_page()); return
+
         self._html(404, b"Not found")
 
     def do_POST(self):
@@ -1268,8 +1579,57 @@ class Handler(BaseHTTPRequestHandler):
             fleet_vms.add("management")
             if vm not in fleet_vms:
                 self._json(400, {"ok": False, "output": f"Unknown VM: {vm}"}); return
+            _write_audit("run-payload", vm, script[:120], self)
             ok, output = run_payload_on_vm(vm, script)
             self._json(200, {"ok": ok, "output": output}); return
+
+        if path == "/service-control":
+            if not _is_authed(self):
+                self._json(403, {"ok": False, "output": "Not authenticated."}); return
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                data    = json.loads(self.rfile.read(length))
+                vm      = str(data.get("vm", ""))[:64]
+                service = str(data.get("service", ""))[:64]
+                action  = str(data.get("action", ""))[:16]
+            except Exception:
+                self._json(400, {"ok": False, "output": "Bad request."}); return
+            fleet     = load_json(TOOLS_DIR / "fleet.json") or {"vms": []}
+            fleet_vms = {v.get("name") for v in fleet.get("vms", []) if v.get("name")}
+            fleet_vms.add("management")
+            if vm not in fleet_vms:
+                self._json(400, {"error": "unknown vm"}); return
+            _write_audit("service-control", vm, f"{action} {service}", self)
+            ec, out = _run_service_control(vm, service, action)
+            self._json(200, {"exit_code": ec, "output": out}); return
+
+        if path == "/enqueue":
+            if not _is_api_authed(self):
+                self._json(403, {"ok": False, "output": "Not authenticated."}); return
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                data     = json.loads(self.rfile.read(length))
+                vm       = str(data.get("vm", "management"))[:64]
+                label    = str(data.get("label", "API job"))[:200]
+                command  = str(data.get("command", ""))[:4096]
+                priority = int(data.get("priority", 5))
+            except Exception:
+                self._json(400, {"ok": False, "output": "Bad request."}); return
+            if not command.strip():
+                self._json(400, {"ok": False, "output": "command required"}); return
+            fleet     = load_json(TOOLS_DIR / "fleet.json") or {"vms": []}
+            fleet_vms = {v.get("name") for v in fleet.get("vms", []) if v.get("name")}
+            fleet_vms.add("management")
+            if vm not in fleet_vms:
+                self._json(400, {"ok": False, "output": f"Unknown VM: {vm}"}); return
+            enq_cmd = (
+                f"python3 ~/cloud-lab/payload/queue/queue_runner.py "
+                f"--enqueue --label {shlex.quote(label)} "
+                f"--command {shlex.quote(command)} --priority {priority}"
+            )
+            ok, out = run_payload_on_vm(vm, enq_cmd)
+            _write_audit("enqueue", vm, f"label={label!r} priority={priority}", self)
+            self._json(200, {"ok": ok, "output": out}); return
 
         if path == "/heartbeat":
             length = int(self.headers.get("Content-Length", 0))

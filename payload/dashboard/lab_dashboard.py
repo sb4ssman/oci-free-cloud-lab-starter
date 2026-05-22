@@ -287,6 +287,24 @@ _IDEAS = [
         "https://github.com/janeczku/calibre-web",
         "pip install calibreweb\ncps",
     ),
+    (
+        "ttyd (Web Terminal)",
+        "Browser-based terminal over WebSockets. One ARM binary — access your lab shell from any browser via SSH tunnel.",
+        ["arm-native", "single binary"],
+        "https://github.com/tsl0922/ttyd",
+        "# grab arm64 binary from github.com/tsl0922/ttyd/releases\n"
+        "chmod +x ttyd && ./ttyd bash\n"
+        "# tunnel: ssh -L 7681:localhost:7681 ubuntu@<lab-ip>\n"
+        "# then open http://localhost:7681 in your browser",
+    ),
+    (
+        "Actual Budget",
+        "Local-first personal finance and budgeting app. Privacy-first, all data stays on your VM.",
+        ["budget", "finance"],
+        "https://actualbudget.org",
+        "npm install --global @actual-app/api\n"
+        "# or install via Docker image: actualbudget/actual-server",
+    ),
 ]
 
 

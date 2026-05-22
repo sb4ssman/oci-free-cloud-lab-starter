@@ -10,7 +10,8 @@ because the tunnel is the gate.
 
 - **System stats:** uptime, CPU load, memory, disk usage with progress bars
 - **Fleet services:** which `cloud-lab-*` services are running and their state
-- **Ideas:** 8 self-hosted projects that work well on the A1 Flex ARM instance
+- **Ideas:** 10 self-hosted projects that work well on the A1 Flex ARM instance,
+  each with a project link and a quick-start install hint
 - **Dark/light mode toggle** (remembers preference via `localStorage`)
 
 ---

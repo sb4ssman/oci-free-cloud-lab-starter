@@ -14,7 +14,7 @@ Installed automatically on every VM during bootstrap.
 
 | Script | Schedule | Purpose |
 |---|---|---|
-| `health_check.py` | Every 4h | System stats + ntfy heartbeat |
+| `health_check.py` | Every 4h | System stats + ntfy heartbeat; alerts if disk >80%, RAM <10%, or load >2× CPU |
 | `log_rotate.sh` | Daily 02:30 | Compress/prune `~/cloud-lab/logs/` |
 | `fleet_report.py` | Daily 06:00 | OCI instance states + ntfy summary |
 
@@ -22,6 +22,32 @@ Install manually: `bash payload/keepalive/install.sh`
 
 These jobs use real CPU (gzip, Python subprocess, OCI API calls) which satisfies
 Oracle's idle-reclamation threshold without fake load.
+
+Resource threshold alerts fire via ntfy with a 12-hour cooldown per condition —
+so a temporarily full disk won't spam you, but a persistent problem will resurface.
+
+---
+
+## payload/queue/ — job queue runner (optional, all VMs)
+
+A 60-second systemd timer that picks and runs the next queued job on a VM.
+Jobs are stored in `~/cloud-lab/queue.json` (JSON, priority-ordered).
+
+| File | Purpose |
+|---|---|
+| `queue_runner.py` | Reads the queue, runs the next pending job, writes results back |
+| `install.sh` | Installs `cloud-lab-queue.timer` (fires every 60 s) |
+
+Submit a job from the command line:
+```bash
+python3 ~/cloud-lab/payload/queue/queue_runner.py \
+  --enqueue --label "My task" --command "bash -c 'echo hello'" --priority 3
+```
+
+Or submit remotely via the admin console: `POST /enqueue` with a JSON body and either
+a session cookie or `Authorization: Bearer <QUEUE_API_KEY>`.
+
+Install manually: `bash payload/queue/install.sh`
 
 ---
 

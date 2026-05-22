@@ -121,7 +121,12 @@ Or just watch the admin console — it auto-refreshes every 60 seconds and shows
 VM state, heartbeat times, uptime, and links to log streams for each background service.
 The console has a dark/light mode toggle, color palette presets, and a **Tools** page
 where you can pick preset scripts or write your own and run them on any fleet VM
-directly from the browser.
+directly from the browser. It also includes:
+
+- **Queue** (`/queue`) — view and manage the job queue across all VMs
+- **Audit log** (`/audit`) — full trail of tool runs, service control, and API-enqueued jobs
+- **Service control** — start/stop/restart individual services from the fleet page
+- **Agent API** — `POST /enqueue` with a Bearer token so an LLM agent can queue work without a browser session
 
 ---
 
@@ -170,7 +175,9 @@ as a TLS-terminating reverse proxy in front of the admin console.
 | Peer health monitoring across all VMs | Wait for A1 Flex capacity (hours to days — out of your hands) |
 | A1 Flex retry loop until capacity granted | — |
 | Self-healing: relaunch terminated VMs | — |
+| Self-healing: worker relaunches management if it goes down | — |
 | Keepalive: periodic CPU activity to prevent idle reclamation | — |
+| Resource alerts: ntfy if disk >80%, RAM <10%, or load spikes | — |
 
 ---
 
@@ -201,9 +208,15 @@ IAM dynamic group and policy for this.
 
 `payload/keepalive/` runs on every VM by default (user crontab, no sudo needed).
 
+`payload/queue/` installs a 60-second systemd timer that runs the next queued job on
+a given VM. The admin console's `/queue` page shows status across all VMs; `/enqueue`
+lets you submit jobs from the browser or from an LLM agent via Bearer token. See
+`payload/queue/install.sh`.
+
 `payload/dashboard/` is an optional lab landing page for the laboratory VM — a simple
-system stats viewer, running services list, and self-hosted project idea board. Access
-it via SSH tunnel on port 8700. See [payload/dashboard/README.md](payload/dashboard/README.md).
+system stats viewer, running services list, and a curated board of self-hosted projects
+that work well on A1 Flex ARM. Access it via SSH tunnel on port 8700. See
+[payload/dashboard/README.md](payload/dashboard/README.md).
 
 To add your own project:
 
@@ -258,8 +271,10 @@ Oracle's queue, not an error you can fix. The orchestrator is retrying. Check pr
 in the orchestrator log above.
 
 **VM terminated unexpectedly** — Oracle reclaimed it (idle or capacity pressure). The
-orchestrator will relaunch it automatically. If the management VM was reclaimed, run
-`launch-management` again and then `bootstrap-mgmt-vm`.
+orchestrator will relaunch worker and laboratory automatically. If the **management VM**
+was reclaimed, the worker VM will detect this within 6 hours and attempt an automatic
+relaunch. If both management and worker are down simultaneously, run `launch-management`
+manually and then `bootstrap-mgmt-vm`.
 
 ---
 

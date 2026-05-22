@@ -184,12 +184,18 @@ body { font-family: system-ui,-apple-system,sans-serif; margin: 0;
 
 .idea-card  { background: var(--c-card); border: 1px solid var(--c-border); border-radius: 12px; padding: 16px 18px; }
 .idea-title { font-size: 14px; font-weight: 700; margin: 0 0 4px; }
+.idea-title a { color: inherit; text-decoration: none; }
+.idea-title a:hover { text-decoration: underline; color: var(--c-accent); }
 .idea-desc  { font-size: 13px; color: var(--c-muted); margin: 0 0 10px; line-height: 1.5; }
-.tags       { display: flex; gap: 5px; flex-wrap: wrap; }
+.tags       { display: flex; gap: 5px; flex-wrap: wrap; margin-bottom: 10px; }
 .tag        { font-size: 11px; padding: 2px 8px; border-radius: 999px;
               background: var(--c-border); color: var(--c-muted); }
 .tag.arm    { background: #dbeafe; color: #1d4ed8; }
 .tag.llm    { background: #ede9fe; color: #6d28d9; }
+.idea-install { background: var(--c-code-bg); color: var(--c-code-text); border-radius: 7px;
+                padding: 9px 12px; font-family: monospace; font-size: 11.5px; line-height: 1.6;
+                white-space: pre; overflow-x: auto; margin: 0; }
+.idea-note  { font-size: 11px; color: var(--c-muted); margin: 16px 0 4px; font-style: italic; }
 
 .tunnel-box { background: var(--c-code-bg); color: var(--c-code-text); border-radius: 10px;
               padding: 14px 18px; font-family: monospace; font-size: 13px; line-height: 1.7;
@@ -222,47 +228,64 @@ function toggleTheme() {
 
 
 # ── Ideas: self-hosted projects that run well on the A1 Flex ──────────────────
+# Each entry: (title, description, tags, homepage_url, quick_install_hint)
 
 _IDEAS = [
     (
         "Vaultwarden",
         "Self-hosted Bitwarden-compatible password manager. Rust binary, ~10 MB, ARM-native.",
         ["arm-native", "single binary"],
+        "https://github.com/dani-garcia/vaultwarden",
+        "docker run -d --name vaultwarden -v ~/vw-data:/data -p 80:80 vaultwarden/server:latest",
     ),
     (
         "Miniflux",
-        "Fast, minimalist RSS reader. Single Go binary, no database setup beyond SQLite.",
+        "Fast, minimalist RSS reader. Single Go binary, Postgres or SQLite backend.",
         ["arm-native", "single binary"],
+        "https://miniflux.app",
+        "# grab latest arm64 binary from github.com/miniflux/v2/releases\nchmod +x miniflux && ./miniflux -migrate -create-admin",
     ),
     (
         "Syncthing",
         "Peer-to-peer file sync — a self-hosted Dropbox. Works great on ARM.",
         ["arm-native", "single binary"],
+        "https://syncthing.net",
+        "sudo apt-get install -y syncthing\nsystemctl --user enable --now syncthing",
     ),
     (
         "Gitea",
-        "Lightweight self-hosted Git service. A full GitHub-like UI in one Go binary.",
+        "Lightweight self-hosted Git service. Full GitHub-like UI in one Go binary.",
         ["arm-native", "single binary"],
+        "https://gitea.com",
+        "# grab latest arm64 binary from dl.gitea.com/gitea/latest/\nchmod +x gitea && ./gitea web",
     ),
     (
         "Jupyter Lab",
-        "Notebook server for Python, data science, and ML. The A1 ARM cores handle it well.",
+        "Notebook server for Python, data science, and ML. The 4 OCPU handles parallel kernels.",
         ["python", "arm-native"],
+        "https://jupyter.org",
+        "pip install jupyterlab\njupyter lab --ip=127.0.0.1 --port=8888 --no-browser",
     ),
     (
         "llama.cpp",
-        "Run quantized LLMs locally. A 7B Q4 model fits comfortably in 24 GB. ARM-optimized.",
+        "Run quantized LLMs locally. A 7B Q4 model fits easily in 24 GB. ARM NEON-optimized.",
         ["arm-native", "llm"],
+        "https://github.com/ggerganov/llama.cpp",
+        "git clone https://github.com/ggerganov/llama.cpp\ncd llama.cpp && make -j$(nproc)",
     ),
     (
         "Netdata",
-        "Real-time system and fleet monitoring dashboard. One-command install, ARM-native.",
+        "Real-time system and fleet monitoring dashboard. One-script install, ARM-native.",
         ["arm-native", "monitoring"],
+        "https://www.netdata.cloud",
+        "wget -O /tmp/netdata.sh https://get.netdata.cloud/kickstart.sh\nbash /tmp/netdata.sh",
     ),
     (
         "Calibre-Web",
         "Browse and serve your ebook library from a web UI. Python + SQLite.",
         ["python"],
+        "https://github.com/janeczku/calibre-web",
+        "pip install calibreweb\ncps",
     ),
 ]
 
@@ -322,19 +345,22 @@ def _render_page() -> str:
 
     # ideas
     ideas_html = ""
-    for title, desc, tags in _IDEAS:
+    for title, desc, tags, url, install in _IDEAS:
         tag_html = "".join(
-            f'<span class="tag{" arm" if t in ("arm-native",) else (" llm" if t == "llm" else "")}">'
+            f'<span class="tag{" arm" if t == "arm-native" else (" llm" if t == "llm" else "")}">'
             f'{html.escape(t)}</span>'
             for t in tags
         )
         ideas_html += (
             f'<div class="idea-card">'
-            f'<p class="idea-title">{html.escape(title)}</p>'
+            f'<p class="idea-title"><a href="{html.escape(url)}" target="_blank" rel="noopener">'
+            f'{html.escape(title)}</a></p>'
             f'<p class="idea-desc">{html.escape(desc)}</p>'
             f'<div class="tags">{tag_html}</div>'
+            f'<pre class="idea-install">{html.escape(install)}</pre>'
             f'</div>'
         )
+    ideas_html += '<p class="idea-note">Community suggestions — review each project\'s docs before installing.</p>'
 
     return (
         f'<!doctype html><html lang="en"><head>'

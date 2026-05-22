@@ -433,10 +433,11 @@ a { color: var(--c-primary); }  a:hover { color: var(--c-primary-lt); }
                align-items: center; margin-bottom: 12px; }
 .vm-name { font-size: 17px; font-weight: 700; }
 .badge { border-radius: 999px; padding: 3px 11px; font-size: 12px;
-         font-weight: 600; background: var(--c-border); color: var(--c-muted); }
-.badge.running     { background: var(--c-ok);  color: var(--c-ok-text); }
+         font-weight: 600; background: #6b7280; color: #fff; }
+.badge.running      { background: #16a34a; color: #fff; }
+.badge.provisioning { background: #d97706; color: #fff; }
 .badge.terminated,
-.badge.terminating { background: var(--c-err); color: var(--c-err-text); }
+.badge.terminating  { background: #dc2626; color: #fff; }
 .card p   { margin: 4px 0; font-size: 14px; }
 .card p b { color: var(--c-muted); font-weight: 600; }
 .notes    { color: var(--c-muted); font-size: 13px; margin-top: 8px; }
@@ -469,7 +470,7 @@ a { color: var(--c-primary); }  a:hover { color: var(--c-primary-lt); }
             background: var(--c-bg); border: 1px solid var(--c-border);
             color: var(--c-text); text-decoration: none; }
 .vmbar a:hover, .svcbar a:hover { background: var(--c-primary-lt); color: #fff; }
-.vmbar a.active, .svcbar a.active { background: var(--c-primary); color: #fff; }
+.vmbar a.active, .svcbar a.active { background: var(--c-accent); color: #1a1a1a; font-weight: 700; }
 
 /* pre/code */
 pre { background: var(--c-code-bg); color: var(--c-code-text);
@@ -535,6 +536,39 @@ label { font-size: 13px; color: var(--c-text);
               border-radius: 10px; padding: 20px; font-size: 13px;
               overflow-x: auto; white-space: pre-wrap; color: var(--c-text); }
 footer { text-align: center; font-size: 12px; color: var(--c-muted); padding: 20px 16px; }
+
+/* mobile */
+@media (max-width: 640px) {
+  .fleet-name { display: none; }
+  .topbar { padding: 0 10px; height: 46px; }
+  .topbar-logo { height: 36px; }
+  .topbar-nav a[href="/export"] { display: none; }
+  .topbar-nav a, .topbar-nav button { padding: 5px 7px; font-size: 13px; }
+}
+
+/* service chips */
+.svc-section { margin-top: 12px; border-top: 1px solid var(--c-border); padding-top: 10px; }
+.svc-label   { font-size: 11px; font-weight: 600; color: var(--c-muted); text-transform: uppercase;
+               letter-spacing: .5px; margin-bottom: 6px; }
+.svc-chips   { display: flex; gap: 6px; flex-wrap: wrap; }
+.svc-chip    { font-size: 11px; padding: 3px 9px; border-radius: 999px; text-decoration: none;
+               background: var(--c-bg); border: 1px solid var(--c-border); color: var(--c-text);
+               transition: background .12s; }
+.svc-chip:hover { background: var(--c-accent); color: #1a1a1a; border-color: var(--c-accent); }
+
+/* tools page */
+.tools-grid   { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit,minmax(280px,1fr)); margin-top: 16px; }
+.payload-card { background: var(--c-card); border: 1px solid var(--c-border); border-radius: 12px;
+                padding: 18px 20px; cursor: pointer; transition: border-color .15s; }
+.payload-card:hover { border-color: var(--c-primary); }
+.payload-title { font-size: 14px; font-weight: 700; margin: 0 0 4px; }
+.payload-desc  { font-size: 13px; color: var(--c-muted); margin: 0; }
+.script-editor { width: 100%; min-height: 140px; font-family: monospace; font-size: 13px;
+                 padding: 12px; border: 1px solid var(--c-border); border-radius: 8px;
+                 background: var(--c-code-bg); color: var(--c-code-text); resize: vertical; margin-top: 16px; }
+.run-bar       { display: flex; gap: 10px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
+.vm-select     { padding: 7px 12px; border-radius: 8px; border: 1px solid var(--c-border);
+                 background: var(--c-bg); color: var(--c-text); font-size: 13px; }
 """
 
 # localStorage keys use 'fleet-' prefix (not 'mda-') for the generic starter.
@@ -652,6 +686,57 @@ _LOG_SERVICES = [
     ("cloud-lab-update",       "Update"),
 ]
 
+_ROLE_SERVICES: dict[str, list[tuple[str, str]]] = {
+    "management": [
+        ("cloud-lab-orchestrator", "Orchestrator"),
+        ("cloud-lab-console",      "Console"),
+        ("cloud-lab-heartbeat",    "Heartbeat · 12h"),
+        ("cloud-lab-crosswatch",   "Crosswatch · 6h"),
+        ("cloud-lab-update",       "Auto-update · nightly"),
+    ],
+    "worker": [
+        ("cloud-lab-a1-lottery",   "A1 Lottery"),
+        ("cloud-lab-heartbeat",    "Heartbeat"),
+        ("cloud-lab-crosswatch",   "Crosswatch"),
+    ],
+    "laboratory": [
+        ("cloud-lab-heartbeat",    "Heartbeat"),
+    ],
+}
+
+_PAYLOAD_PRESETS: list[tuple[str, str, str, str]] = [
+    (
+        "system-info",
+        "System info",
+        "CPU, memory, disk, uptime at a glance",
+        "echo '=== Uptime ===' && uptime\necho\necho '=== Memory ===' && free -h --si\necho\necho '=== Disk ===' && df -h",
+    ),
+    (
+        "list-services",
+        "List services",
+        "All cloud-lab systemd units and their status",
+        "systemctl list-units 'cloud-lab-*' --all --no-pager",
+    ),
+    (
+        "update-repo",
+        "Update repo",
+        "Pull latest code from origin and restart all services",
+        "cd ~/cloud-lab && git pull --ff-only && sudo systemctl restart 'cloud-lab-*'",
+    ),
+    (
+        "apt-upgrade",
+        "APT upgrade",
+        "Update package lists and upgrade installed packages",
+        "sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get upgrade -y",
+    ),
+    (
+        "check-logs",
+        "Check logs",
+        "Recent journal entries for all cloud-lab services",
+        "sudo journalctl -u 'cloud-lab-*' -n 50 --no-pager --output=short-iso",
+    ),
+]
+
 
 # ── shared HTML helpers ───────────────────────────────────────────────────────
 
@@ -674,6 +759,7 @@ def _topbar(active: str = "") -> str:
         ("Fleet",  "/",       "fleet"),
         ("Stats",  "/stats",  "stats"),
         ("Logs",   "/logs",   "logs"),
+        ("Tools",  "/tools",  "tools"),
         ("Export", "/export", "export"),
     ]
     links = " ".join(
@@ -750,7 +836,8 @@ def vm_cards() -> str:
         shape      = html.escape(instance.get("shape") or vm.get("shape", ""))
         public_ip  = html.escape(profile.get("public_ip") or "—")
         private_ip = html.escape(profile.get("private_ip") or "—")
-        role_label = html.escape(vm.get("role", name))
+        role       = vm.get("role", name)
+        role_label = html.escape(role)
         notes      = html.escape(vm.get("notes", ""))
         synced_at  = profile.get("synced_at", "")
 
@@ -773,10 +860,27 @@ def vm_cards() -> str:
             actions.append(
                 f'<button class="act-btn" onclick="copyText({json.dumps(ssh_cmd)},this)">Copy SSH</button>'
             )
+        actions.append(f'<a class="act-btn" href="/tools?vm={html.escape(name)}">Tools</a>')
         if name == "worker":
             actions.append(
                 '<a class="act-btn accent" href="/logs?vm=worker&service=cloud-lab-a1-lottery">Lottery logs</a>'
             )
+
+        svcs = _ROLE_SERVICES.get(role, [])
+        if svcs:
+            chip_links = "".join(
+                f'<a class="svc-chip" href="/logs?vm={html.escape(name)}&service={html.escape(svc_id)}">'
+                f'{html.escape(svc_lbl)}</a>'
+                for svc_id, svc_lbl in svcs
+            )
+            svc_html = (
+                f'<div class="svc-section">'
+                f'<div class="svc-label">Background Services</div>'
+                f'<div class="svc-chips">{chip_links}</div>'
+                f'</div>'
+            )
+        else:
+            svc_html = ""
 
         cards.append(
             f'<div class="card">'
@@ -792,7 +896,8 @@ def vm_cards() -> str:
             f'<p><b>Heartbeat:</b> {hb_ago}</p>'
             + (f'<p class="notes">{notes}</p>' if notes else "")
             + f'<div class="card-actions">{"".join(actions)}</div>'
-            f'</div>'
+            + svc_html
+            + '</div>'
         )
     return "\n".join(cards)
 
@@ -929,6 +1034,111 @@ def export_page() -> bytes:
     return page.encode("utf-8")
 
 
+# ── tools page ───────────────────────────────────────────────────────────────
+
+def run_payload_on_vm(vm_name: str, script: str) -> tuple[bool, str]:
+    if vm_name == "management":
+        try:
+            result = subprocess.run(
+                ["bash", "-s"],
+                input=script,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=30,
+            )
+            return True, result.stdout or "(no output)"
+        except Exception as exc:
+            return False, str(exc)
+    else:
+        refresh_oci_snapshots()
+        env      = _mgmt_env()
+        ssh_key  = env.get("OCI_SSH_PRIVATE_KEY_PATH", str(Path.home() / ".ssh" / "fleet.key"))
+        ssh_user = env.get("OCI_SSH_USER", "ubuntu")
+        profile  = load_json(TOOLS_DIR / "vm-profiles" / f"{vm_name}.json") or {}
+        public_ip = profile.get("public_ip", "")
+        if not public_ip or public_ip == "—":
+            return False, f"No public IP found for {vm_name}."
+        key_path = str(Path(ssh_key).expanduser())
+        try:
+            result = subprocess.run(
+                ["ssh", "-i", key_path,
+                 "-o", "StrictHostKeyChecking=accept-new",
+                 "-o", "ConnectTimeout=8", "-o", "BatchMode=yes",
+                 f"{ssh_user}@{public_ip}", "bash -s"],
+                input=script,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=60,
+            )
+            return True, result.stdout or "(no output)"
+        except subprocess.TimeoutExpired:
+            return False, f"SSH timed out connecting to {vm_name}."
+        except Exception as exc:
+            return False, str(exc)
+
+
+def tools_page(preselect_vm: str = "") -> bytes:
+    title     = f"{FLEET_NAME} — Tools"
+    fleet     = load_json(TOOLS_DIR / "fleet.json") or {"vms": []}
+    vms       = [v.get("name") for v in fleet.get("vms", []) if v.get("name")]
+    if not vms:
+        vms = ["management"]
+    preselect = preselect_vm if preselect_vm in vms else vms[0]
+
+    vm_options = "".join(
+        f'<option value="{html.escape(v)}"{" selected" if v == preselect else ""}>{html.escape(v)}</option>'
+        for v in vms
+    )
+
+    preset_cards = "".join(
+        f'<div class="payload-card" onclick="loadPreset({json.dumps(script)})">'
+        f'<p class="payload-title">{html.escape(label)}</p>'
+        f'<p class="payload-desc">{html.escape(desc)}</p>'
+        f'</div>'
+        for _slug, label, desc, script in _PAYLOAD_PRESETS
+    )
+
+    page = (
+        _head(title)
+        + _topbar("tools")
+        + '<div class="content">'
+        + '<h2 style="margin:0 0 4px">Admin Tools</h2>'
+        + '<p style="color:var(--c-muted);font-size:14px;margin:0 0 16px">Run scripts on fleet VMs via SSH.</p>'
+        + '<h3 style="font-size:13px;font-weight:700;margin:0 0 8px;color:var(--c-muted);text-transform:uppercase;letter-spacing:.5px">Presets</h3>'
+        + '<div class="tools-grid">' + preset_cards + '</div>'
+        + '<h3 style="font-size:13px;font-weight:700;margin:20px 0 8px;color:var(--c-muted);text-transform:uppercase;letter-spacing:.5px">Script</h3>'
+        + '<textarea id="payload-editor" class="script-editor" placeholder="Enter bash script here, or click a preset above..."></textarea>'
+        + '<div class="run-bar">'
+        + '<select id="payload-vm" class="vm-select">' + vm_options + '</select>'
+        + '<button class="btn" onclick="runPayload()">Run on VM</button>'
+        + '<span id="payload-status" style="font-size:13px;color:var(--c-muted)"></span>'
+        + '</div>'
+        + '<pre id="payload-output" style="margin-top:16px;display:none"></pre>'
+        + "<script>"
+        + "function loadPreset(script){"
+        + "  document.getElementById('payload-editor').value=script;"
+        + "  document.getElementById('payload-editor').scrollIntoView({behavior:'smooth'});}"
+        + "function runPayload(){"
+        + "  var script=document.getElementById('payload-editor').value.trim();"
+        + "  var vm=document.getElementById('payload-vm').value;"
+        + "  if(!script){alert('No script entered.');return;}"
+        + "  var status=document.getElementById('payload-status');"
+        + "  var out=document.getElementById('payload-output');"
+        + "  status.textContent='Running…';out.style.display='none';"
+        + "  fetch('/run-payload',{method:'POST',"
+        + "    headers:{'Content-Type':'application/json'},"
+        + "    body:JSON.stringify({vm:vm,script:script})})"
+        + "  .then(function(r){return r.json();})"
+        + "  .then(function(d){"
+        + "    status.textContent=d.ok?'Done.':'Error.';"
+        + "    out.textContent=d.output||'(no output)';out.style.display='block';})"
+        + "  .catch(function(e){"
+        + "    status.textContent='Request failed.';"
+        + "    out.textContent=String(e);out.style.display='block';});}"
+        + "</script>"
+        + '</div></body></html>'
+    )
+    return page.encode("utf-8")
+
+
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
 class Handler(BaseHTTPRequestHandler):
@@ -986,11 +1196,33 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/export":
             self._html(200, export_page()); return
 
+        if path == "/tools":
+            preselect = qs.get("vm", [""])[0]
+            self._html(200, tools_page(preselect)); return
+
         self._html(404, b"Not found")
 
     def do_POST(self):
         parsed = urlparse(self.path)
         path   = parsed.path.rstrip("/") or "/"
+
+        if path == "/run-payload":
+            if not _is_authed(self):
+                self._json(403, {"ok": False, "output": "Not authenticated."}); return
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                data   = json.loads(self.rfile.read(length))
+                vm     = str(data.get("vm", "management"))[:64]
+                script = str(data.get("script", ""))[:8192]
+            except Exception:
+                self._json(400, {"ok": False, "output": "Bad request."}); return
+            fleet     = load_json(TOOLS_DIR / "fleet.json") or {"vms": []}
+            fleet_vms = {v.get("name") for v in fleet.get("vms", []) if v.get("name")}
+            fleet_vms.add("management")
+            if vm not in fleet_vms:
+                self._json(400, {"ok": False, "output": f"Unknown VM: {vm}"}); return
+            ok, output = run_payload_on_vm(vm, script)
+            self._json(200, {"ok": ok, "output": output}); return
 
         if path == "/heartbeat":
             length = int(self.headers.get("Content-Length", 0))

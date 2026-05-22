@@ -25,13 +25,23 @@ Oracle's idle-reclamation threshold without fake load.
 
 ---
 
+## payload/dashboard/ — lab landing page (optional)
+
+An example payload for the laboratory VM: system stats, running services list, and
+a curated board of self-hosted projects that work well on the A1 Flex ARM instance.
+Accessible via SSH tunnel on port 8700. Pure Python stdlib — no pip install needed.
+
+See [dashboard/README.md](dashboard/README.md) to install it.
+
+---
+
 ## Adding your own payload
 
 1. Create a directory under `payload/` for your project.
-2. Add a `install.sh` that idempotently sets up whatever your payload needs
+2. Add an `install.sh` that idempotently sets up whatever your payload needs
    (cron jobs, systemd units, application files).
-3. Call your `install.sh` from `fleet/<role>/setup.sh` at the bottom of the
-   "Payload layer" section, or run it manually after SSH-ing into the VM.
+3. Call your `install.sh` from `fleet/<role>/setup.sh` at the bottom of the script,
+   or deploy it via `ssh-vm` after the fleet is up.
 
 The keepalive payload stays in place regardless of what else you install — it
 is the baseline that keeps your fleet alive and monitored.

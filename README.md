@@ -117,8 +117,11 @@ from your machine at any time:
 **Windows:** `admin\check-all-vms.bat`
 **Mac/Linux:** `bash admin/check-all-vms.sh`
 
-Or just watch the admin console — it auto-refreshes every 60 seconds and shows
-live VM state and heartbeat times.
+Or just watch the admin console — it auto-refreshes every 60 seconds and shows live
+VM state, heartbeat times, uptime, and links to log streams for each background service.
+The console has a dark/light mode toggle, color palette presets, and a **Tools** page
+where you can pick preset scripts or write your own and run them on any fleet VM
+directly from the browser.
 
 ---
 
@@ -144,9 +147,9 @@ All scripts are in `admin/`. Run them from the repo root. `.bat` for Windows,
 Three VMs, two shapes — all within Oracle's Always Free tier:
 
 ```
-management   VM.Standard.E2.1.Micro    Orchestrator · admin console · heartbeat · crosswatch
-worker       VM.Standard.E2.1.Micro    General compute — available for your workloads
-laboratory       VM.Standard.A1.Flex       4 OCPU / 24 GB RAM — your main resource
+management   VM.Standard.E2.1.Micro   Orchestrator · admin console · heartbeat · crosswatch
+worker       VM.Standard.E2.1.Micro   A1 lottery runner · general compute while waiting
+laboratory   VM.Standard.A1.Flex      4 OCPU / 24 GB RAM — your main resource
 ```
 
 VM configuration is in `fleet.json` (committed, safe to edit). Role-specific
@@ -197,11 +200,16 @@ IAM dynamic group and policy for this.
 ## Layering your own workload
 
 `payload/keepalive/` runs on every VM by default (user crontab, no sudo needed).
-To add your project:
+
+`payload/dashboard/` is an optional lab landing page for the laboratory VM — a simple
+system stats viewer, running services list, and self-hosted project idea board. Access
+it via SSH tunnel on port 8700. See [payload/dashboard/README.md](payload/dashboard/README.md).
+
+To add your own project:
 
 1. Create `payload/<your-project>/`
 2. Add an idempotent `install.sh`
-3. Call it from `fleet/<role>/setup.sh`, or run it via `ssh-vm` after the fleet is up
+3. Call it from `fleet/<role>/setup.sh`, or deploy it via `ssh-vm` after the fleet is up
 
 See [payload/README.md](payload/README.md) for details.
 
@@ -232,7 +240,7 @@ Let's Encrypt cert. Wait 60 seconds and reload.
 
 **Admin console not loading at all** — check Caddy on the management VM:
 ```bash
-bash admin/ssh-vm.sh management
+bash admin/ssh-vm.sh management  # or: admin\ssh-vm.bat management (Windows)
 sudo systemctl status caddy
 sudo journalctl -u caddy -n 50
 ```
@@ -241,7 +249,7 @@ sudo journalctl -u caddy -n 50
 
 **Worker or laboratory stuck as NOT FOUND** — the orchestrator is working on it. Check:
 ```bash
-bash admin/ssh-vm.sh management
+bash admin/ssh-vm.sh management  # or: admin\ssh-vm.bat management (Windows)
 journalctl -u cloud-lab-orchestrator -f
 ```
 

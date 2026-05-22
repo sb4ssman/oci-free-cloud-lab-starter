@@ -45,6 +45,7 @@ def main() -> None:
 
     mgmt_ip = env.get("FLEET_MANAGEMENT_PRIVATE_IP", "")
     vm_name = env.get("FLEET_VM_NAME", "worker")
+    heartbeat_token = env.get("FLEET_HEARTBEAT_TOKEN", "")
 
     if not mgmt_ip:
         print("[heartbeat] FLEET_MANAGEMENT_PRIVATE_IP not set — skipping.", flush=True)
@@ -54,9 +55,12 @@ def main() -> None:
     url = f"http://{mgmt_ip}:8765/heartbeat"
     print(f"[heartbeat] POSTing to {url} as {vm_name}...", flush=True)
     try:
+        headers = {"Content-Type": "application/json"}
+        if heartbeat_token:
+            headers["Authorization"] = f"Bearer {heartbeat_token}"
         req = urllib.request.Request(
             url, data=payload,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
         urllib.request.urlopen(req, timeout=10).read()

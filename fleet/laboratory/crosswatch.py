@@ -139,7 +139,7 @@ def notify_ntfy(topic: str, title: str, message: str, priority: str = "high") ->
         print(f"[crosswatch] ntfy failed: {exc}", flush=True)
 
 
-def report_to_management(mgmt_ip: str, vm_name: str, event: str, details: dict) -> None:
+def report_to_management(mgmt_ip: str, vm_name: str, event: str, details: dict, heartbeat_token: str = "") -> None:
     if not mgmt_ip:
         print("[crosswatch] no management IP — cannot report event.", flush=True)
         return
@@ -150,10 +150,13 @@ def report_to_management(mgmt_ip: str, vm_name: str, event: str, details: dict) 
         "details": details,
     }).encode("utf-8")
     try:
+        headers = {"Content-Type": "application/json"}
+        if heartbeat_token:
+            headers["Authorization"] = f"Bearer {heartbeat_token}"
         req = urllib.request.Request(
             f"http://{mgmt_ip}:8765/heartbeat",
             data=payload,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
         urllib.request.urlopen(req, timeout=10).read()
@@ -182,6 +185,7 @@ def main() -> None:
     compartment_id = env.get("OCI_COMPARTMENT_ID", "")
     ntfy_topic     = env.get("NOTIFY_NTFY_TOPIC", "")
     this_vm        = env.get("FLEET_VM_NAME", "laboratory")
+    heartbeat_token = env.get("FLEET_HEARTBEAT_TOKEN", "")
 
     if not compartment_id:
         print("[crosswatch] OCI_COMPARTMENT_ID not set — skipping.", flush=True)
@@ -256,6 +260,7 @@ def main() -> None:
                 this_vm,
                 "peer_unhealthy",
                 {"peer": name, "state": state, "expected": "RUNNING"},
+                heartbeat_token,
             )
 
     print("[crosswatch] Done.", flush=True)

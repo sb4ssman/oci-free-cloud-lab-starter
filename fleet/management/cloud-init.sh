@@ -36,10 +36,27 @@ iptables -C INPUT -p tcp -s 10.0.0.0/16 --dport 8765 -j ACCEPT 2>/dev/null || ip
 netfilter-persistent save
 
 echo "[cloud-init] Cloning fleet repo..."
-sudo -u ubuntu git clone \
-    "https://oauth2:${GITHUB_TOKEN}@github.com/${FLEET_REPO}.git" \
-    /home/ubuntu/cloud-lab \
+clean_repo_url() {
+    case "$FLEET_REPO" in
+        git@*|ssh://*|https://*) printf '%s\n' "$FLEET_REPO" ;;
+        *.git) printf 'https://github.com/%s\n' "$FLEET_REPO" ;;
+        *) printf 'https://github.com/%s.git\n' "$FLEET_REPO" ;;
+    esac
+}
+auth_repo_url() {
+    local clean
+    clean="$(clean_repo_url)"
+    if [[ -n "${GITHUB_TOKEN:-}" && "$clean" == https://github.com/* ]]; then
+        printf '%s\n' "${clean/https:\/\/github.com\//https:\/\/oauth2:${GITHUB_TOKEN}@github.com\/}"
+    else
+        printf '%s\n' "$clean"
+    fi
+}
+CLONE_URL="$(auth_repo_url)"
+CLEAN_URL="$(clean_repo_url)"
+sudo -u ubuntu git clone "$CLONE_URL" /home/ubuntu/cloud-lab \
   || sudo -u ubuntu git -C /home/ubuntu/cloud-lab pull --ff-only
+sudo -u ubuntu git -C /home/ubuntu/cloud-lab remote set-url origin "$CLEAN_URL" || true
 
 echo "[cloud-init] Generating fleet SSH keypair..."
 if [ ! -f /home/ubuntu/.ssh/fleet.key ]; then
@@ -61,6 +78,8 @@ GITHUB_TOKEN=${GITHUB_TOKEN}
 FLEET_REPO=${FLEET_REPO}
 FLEET_NAME=${FLEET_NAME}
 FLEET_VM_NAME=management
+QUEUE_API_KEY=${QUEUE_API_KEY}
+FLEET_HEARTBEAT_TOKEN=${FLEET_HEARTBEAT_TOKEN}
 ADMIN_DOMAIN=${ADMIN_DOMAIN}
 ADMIN_CONSOLE_HOST=0.0.0.0
 ADMIN_USERNAME=${ADMIN_USERNAME}

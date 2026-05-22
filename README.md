@@ -47,12 +47,12 @@ Complete all of these before running anything.
 - [ ] **SSH key pair** — generate one at `~/.ssh/fleet.key` if you don't have one:
       `ssh-keygen -t ed25519 -f ~/.ssh/fleet.key`
 - [ ] **DuckDNS account + subdomain** — free at [duckdns.org](https://www.duckdns.org/).
-      You need this for the admin console's HTTPS certificate.
+      You need this hostname for the admin console's HTTPS certificate.
 - [ ] **ntfy topic name** — free at [ntfy.sh](https://ntfy.sh/). Pick any unique string;
       this is how the fleet notifies you. (Optional but strongly recommended.)
-- [ ] **GitHub account** — you need to fork this repo so VMs can clone your copy.
-      Create a read-only [personal access token](https://github.com/settings/tokens)
-      with `repo` scope for the `GITHUB_TOKEN` in `.env`.
+- [ ] **GitHub account** — fork this repo so VMs can clone your copy.
+      Public forks can leave `GITHUB_TOKEN` blank. Private forks need a fine-grained,
+      read-only token limited to this repository.
 
 ---
 
@@ -70,13 +70,21 @@ git clone https://github.com/YOUR_USERNAME/oci-free-cloud-lab-starter.git
 cd oci-free-cloud-lab-starter
 
 cp .env.example .env
-# Edit .env — see the comments; every field is explained
+# Edit .env — see the comments; every field is explained.
+# Set FLEET_REPO to owner/repo, for example: YOUR_USERNAME/oci-free-cloud-lab-starter
 ```
 
 Generate your admin console password hash:
 ```bash
 python admin/hash_password.py
 # Paste the output into ADMIN_PASSWORD_HASH in .env
+# Then leave ADMIN_PASSWORD blank.
+```
+
+Generate API tokens for the queue endpoint and internal fleet heartbeats:
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+# Run twice; paste one value into QUEUE_API_KEY and one into FLEET_HEARTBEAT_TOKEN.
 ```
 
 ### 3. Create OCI network resources (once)
@@ -126,7 +134,7 @@ directly from the browser. It also includes:
 - **Queue** (`/queue`) — view and manage the job queue across all VMs
 - **Audit log** (`/audit`) — full trail of tool runs, service control, and API-enqueued jobs
 - **Service control** — start/stop/restart individual services from the fleet page
-- **Agent API** — `POST /enqueue` with a Bearer token so an LLM agent can queue work without a browser session
+- **Agent API** — `POST /enqueue` with `Authorization: Bearer <QUEUE_API_KEY>` so an LLM agent can queue work without a browser session
 
 ---
 
@@ -199,8 +207,13 @@ try to relaunch simultaneously, Oracle may reject the second. Launch sequentiall
 let the orchestrator handle it.
 
 **Instance-principal auth.**  VMs authenticate to OCI using instance-principal — no
-API key is stored on any VM. The `setup-oci-network` script creates the required
-IAM dynamic group and policy for this.
+OCI API key is stored on any VM. The `setup-oci-network` script creates the required
+IAM dynamic group and policy. The policy is scoped to instance management, VCN use,
+and resource inspection inside the configured compartment.
+
+**GitHub repo access.**  Public forks do not need `GITHUB_TOKEN`. Private forks need
+a read-only token so cloud-init can clone the repo; treat that token as a VM-resident
+secret and rotate it if a VM is compromised.
 
 ---
 
@@ -239,10 +252,13 @@ those into your project's `.env`. The fleet keeps managing itself independently.
   plaintext never leaves your machine
 - VMs authenticate to OCI via instance-principal — no API key on any VM
 - `vm-profiles/` state snapshots are gitignored (contain IP addresses)
-- Admin console binds to `localhost:8765`; Caddy handles TLS and public exposure
-- Session cookie is `HttpOnly; SameSite=Strict` with 7-day expiry
+- Admin console listens on the management VM; Caddy handles TLS and public exposure
+- Session cookie is `HttpOnly; Secure; SameSite=Strict` with 7-day expiry
 - Login is rate-limited: 5 attempts per IP per 15 minutes
-- `GITHUB_TOKEN` needs only read (`repo`) scope — VMs never push anything
+- `QUEUE_API_KEY` can queue shell commands on fleet VMs; store it like a password
+- `FLEET_HEARTBEAT_TOKEN` protects VM-to-management heartbeat writes
+- The Tools page and queue intentionally execute shell commands after authentication
+- `GITHUB_TOKEN` is optional for public forks; private forks should use a fine-grained read-only token
 
 ---
 

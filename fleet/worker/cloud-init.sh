@@ -14,9 +14,27 @@ if [ ! -f /home/ubuntu/bin/oci ]; then
 fi
 ln -sf /home/ubuntu/bin/oci /usr/local/bin/oci
 
-CLONE_URL="https://oauth2:${GITHUB_TOKEN}@github.com/${FLEET_REPO}.git"
+clean_repo_url() {
+    case "$FLEET_REPO" in
+        git@*|ssh://*|https://*) printf '%s\n' "$FLEET_REPO" ;;
+        *.git) printf 'https://github.com/%s\n' "$FLEET_REPO" ;;
+        *) printf 'https://github.com/%s.git\n' "$FLEET_REPO" ;;
+    esac
+}
+auth_repo_url() {
+    local clean
+    clean="$(clean_repo_url)"
+    if [[ -n "${GITHUB_TOKEN:-}" && "$clean" == https://github.com/* ]]; then
+        printf '%s\n' "${clean/https:\/\/github.com\//https:\/\/oauth2:${GITHUB_TOKEN}@github.com\/}"
+    else
+        printf '%s\n' "$clean"
+    fi
+}
+CLONE_URL="$(auth_repo_url)"
+CLEAN_URL="$(clean_repo_url)"
 sudo -u ubuntu git clone "$CLONE_URL" /home/ubuntu/cloud-lab \
   || sudo -u ubuntu git -C /home/ubuntu/cloud-lab pull --ff-only
+sudo -u ubuntu git -C /home/ubuntu/cloud-lab remote set-url origin "$CLEAN_URL" || true
 
 echo "[cloud-init] Generating fleet SSH keypair..."
 if [ ! -f /home/ubuntu/.ssh/fleet.key ]; then
@@ -35,6 +53,7 @@ GITHUB_TOKEN=${GITHUB_TOKEN}
 FLEET_REPO=${FLEET_REPO}
 FLEET_NAME=${FLEET_NAME}
 FLEET_VM_NAME=worker
+FLEET_HEARTBEAT_TOKEN=${FLEET_HEARTBEAT_TOKEN}
 OCI_SSH_PUBLIC_KEY_PATH=/home/ubuntu/.ssh/fleet.key.pub
 OCI_SSH_PRIVATE_KEY_PATH=/home/ubuntu/.ssh/fleet.key
 OCI_SSH_USER=ubuntu

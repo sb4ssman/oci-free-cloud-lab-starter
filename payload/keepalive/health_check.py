@@ -237,7 +237,7 @@ def ntfy_heartbeat(topic: str, vm_name: str, fleet_name: str, stats: dict, serve
         print(f"[health_check] ntfy failed: {exc}", flush=True)
 
 
-def report_to_management(mgmt_ip: str, vm_name: str, stats: dict) -> None:
+def report_to_management(mgmt_ip: str, vm_name: str, stats: dict, heartbeat_token: str = "") -> None:
     if not mgmt_ip:
         print("[health_check] FLEET_MANAGEMENT_PRIVATE_IP not set — cannot report to management.", flush=True)
         return
@@ -248,10 +248,13 @@ def report_to_management(mgmt_ip: str, vm_name: str, stats: dict) -> None:
         "details": stats,
     }).encode("utf-8")
     try:
+        headers = {"Content-Type": "application/json"}
+        if heartbeat_token:
+            headers["Authorization"] = f"Bearer {heartbeat_token}"
         req = urllib.request.Request(
             f"http://{mgmt_ip}:8765/heartbeat",
             data=payload,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
         urllib.request.urlopen(req, timeout=10).read()
@@ -277,6 +280,7 @@ def main() -> None:
     vm_name     = env.get("FLEET_VM_NAME", "unknown")
     fleet_name  = env.get("FLEET_NAME", "Cloud Lab")
     mgmt_ip     = env.get("FLEET_MANAGEMENT_PRIVATE_IP", "")
+    heartbeat_token = env.get("FLEET_HEARTBEAT_TOKEN", "")
 
     # Check thresholds and fire alerts if needed (management sends directly, others via management)
     if topic:
@@ -285,7 +289,7 @@ def main() -> None:
     if vm_name == "management" and topic:
         ntfy_heartbeat(topic, vm_name, fleet_name, stats, ntfy_server)
     elif vm_name != "management":
-        report_to_management(mgmt_ip, vm_name, stats)
+        report_to_management(mgmt_ip, vm_name, stats, heartbeat_token)
     else:
         print("[health_check] NOTIFY_NTFY_TOPIC not set — skipping ntfy.", flush=True)
 

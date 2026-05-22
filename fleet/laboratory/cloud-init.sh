@@ -14,9 +14,27 @@ if [ ! -f /home/ubuntu/bin/oci ]; then
 fi
 ln -sf /home/ubuntu/bin/oci /usr/local/bin/oci
 
-CLONE_URL="https://oauth2:${GITHUB_TOKEN}@github.com/${FLEET_REPO}.git"
+clean_repo_url() {
+    case "$FLEET_REPO" in
+        git@*|ssh://*|https://*) printf '%s\n' "$FLEET_REPO" ;;
+        *.git) printf 'https://github.com/%s\n' "$FLEET_REPO" ;;
+        *) printf 'https://github.com/%s.git\n' "$FLEET_REPO" ;;
+    esac
+}
+auth_repo_url() {
+    local clean
+    clean="$(clean_repo_url)"
+    if [[ -n "${GITHUB_TOKEN:-}" && "$clean" == https://github.com/* ]]; then
+        printf '%s\n' "${clean/https:\/\/github.com\//https:\/\/oauth2:${GITHUB_TOKEN}@github.com\/}"
+    else
+        printf '%s\n' "$clean"
+    fi
+}
+CLONE_URL="$(auth_repo_url)"
+CLEAN_URL="$(clean_repo_url)"
 sudo -u ubuntu git clone "$CLONE_URL" /home/ubuntu/cloud-lab \
   || sudo -u ubuntu git -C /home/ubuntu/cloud-lab pull --ff-only
+sudo -u ubuntu git -C /home/ubuntu/cloud-lab remote set-url origin "$CLEAN_URL" || true
 
 install -d -m 755 -o ubuntu -g ubuntu /home/ubuntu/.config/cloud-lab
 cat > /home/ubuntu/.config/cloud-lab/laboratory.env << 'ENVEOF'
@@ -29,6 +47,7 @@ GITHUB_TOKEN=${GITHUB_TOKEN}
 FLEET_REPO=${FLEET_REPO}
 FLEET_NAME=${FLEET_NAME}
 FLEET_VM_NAME=laboratory
+FLEET_HEARTBEAT_TOKEN=${FLEET_HEARTBEAT_TOKEN}
 ENVEOF
 chmod 600 /home/ubuntu/.config/cloud-lab/laboratory.env
 chown ubuntu:ubuntu /home/ubuntu/.config/cloud-lab/laboratory.env

@@ -8,7 +8,7 @@ Endpoints:
   GET  /login               Login form
   POST /login               Validate credentials, set session cookie, redirect to /
   GET  /logout              Clear session, redirect to /login
-  POST /heartbeat           Liveness pings from worker/laboratory (no auth)
+  POST /heartbeat           Liveness pings from worker/laboratory (Bearer token if configured)
   GET  /export              Fleet connection details (login required)
   GET  /stats?vm=<name>     Live system stats (login required)
   GET  /logs?vm=<name>&service=<svc>  Journalctl logs (login required)
@@ -47,6 +47,7 @@ PROFILE_DIR     = TOOLS_DIR / "vm-profiles"
 HEARTBEATS_FILE = TOOLS_DIR / "vm-profiles" / "_heartbeats.json"
 AUDIT_LOG        = TOOLS_DIR / "logs" / "audit.jsonl"
 QUEUE_API_KEY    = os.getenv("QUEUE_API_KEY", "")
+HEARTBEAT_TOKEN  = os.getenv("FLEET_HEARTBEAT_TOKEN", "")
 
 COOKIE_NAME      = "fleet_session"
 SESSION_DURATION = 7 * 24 * 3600   # 7 days
@@ -69,6 +70,10 @@ _fails_lock  = threading.Lock()
 MAX_LOGIN_ATTEMPTS = 5
 LOCKOUT_SECONDS    = 900
 _ACT = 'class="active"'   # used in f-string nav links (backslashes not allowed in f-expr)
+
+MAX_LOGIN_BODY      = 8_192
+MAX_HEARTBEAT_BODY  = 16_384
+MAX_API_BODY        = 64_000
 
 
 # ── auth helpers ──────────────────────────────────────────────────────────────
@@ -382,9 +387,20 @@ def _is_api_authed(handler: "BaseHTTPRequestHandler") -> bool:
         return True
     if QUEUE_API_KEY:
         auth = handler.headers.get("Authorization", "")
-        if auth.startswith("Bearer ") and auth[7:].strip() == QUEUE_API_KEY:
+        if auth.startswith("Bearer ") and secrets.compare_digest(auth[7:].strip(), QUEUE_API_KEY):
             return True
     return False
+
+
+def _is_heartbeat_authed(handler: "BaseHTTPRequestHandler") -> bool:
+    """Require a shared heartbeat token when configured.
+
+    Empty token keeps old deployments compatible, but new starters should set it.
+    """
+    if not HEARTBEAT_TOKEN:
+        return True
+    auth = handler.headers.get("Authorization", "")
+    return auth.startswith("Bearer ") and secrets.compare_digest(auth[7:].strip(), HEARTBEAT_TOKEN)
 
 
 def _write_audit(action: str, vm: str, details: str,
@@ -777,7 +793,7 @@ footer { text-align: center; font-size: 12px; color: var(--c-muted); padding: 20
                  background: var(--c-bg); color: var(--c-text); font-size: 13px; }
 """
 
-# localStorage keys use 'fleet-' prefix (not 'mda-') for the generic starter.
+# localStorage keys use a generic 'fleet-' prefix.
 THEME_JS = """
 (function() {
   var saved = localStorage.getItem('fleet-theme');
@@ -890,7 +906,7 @@ function copyText(text, btn) {
 PALETTE_PRESETS = [
     ("#374151", "#4b5563", "#1f2937", "#f59e0b", "Slate"),       # default neutral
     ("#1a3d6e", "#2d6cb5", "#0f2547", "#38bdf8", "Ocean"),       # navy + sky blue
-    ("#285e39", "#3a7a50", "#1b3f28", "#c5a028", "MDA Green"),   # forest green + gold
+    ("#285e39", "#3a7a50", "#1b3f28", "#c5a028", "Forest"),     # forest green + gold
     ("#0d1117", "#1c2128", "#010409", "#39ff14", "Neons"),       # near-black + neon green
     ("#6b4226", "#8a5530", "#4a2d1b", "#d4882a", "Earthy"),     # terracotta + warm amber
 ]
@@ -942,10 +958,10 @@ _PAYLOAD_PRESETS: list[tuple[str, str, str, str]] = [
         "cd ~/cloud-lab && git pull --ff-only && sudo systemctl restart 'cloud-lab-*'",
     ),
     (
-        "apt-upgrade",
-        "APT upgrade",
-        "Update package lists and upgrade installed packages",
-        "sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get upgrade -y",
+        "apt-maintenance",
+        "APT maintenance",
+        "Update package metadata and clean cached packages",
+        "sudo apt-get update -qq && sudo apt-get autoclean -qq",
     ),
     (
         "check-logs",
@@ -1490,6 +1506,25 @@ def audit_page() -> bytes:
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
 class Handler(BaseHTTPRequestHandler):
+    def _read_body(self, limit: int) -> bytes | None:
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            return None
+        if length < 0 or length > limit:
+            return None
+        return self.rfile.read(length)
+
+    def _read_json_body(self, limit: int) -> dict | None:
+        body = self._read_body(limit)
+        if body is None:
+            return None
+        try:
+            data = json.loads(body)
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path   = parsed.path.rstrip("/") or "/"
@@ -1499,7 +1534,7 @@ class Handler(BaseHTTPRequestHandler):
             self._html(200, login_page()); return
         if path == "/logout":
             self._redirect("/login",
-                           f'{COOKIE_NAME}=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict')
+                           f'{COOKIE_NAME}=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Strict')
             return
 
         if not _is_authed(self):
@@ -1567,13 +1602,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/run-payload":
             if not _is_authed(self):
                 self._json(403, {"ok": False, "output": "Not authenticated."}); return
-            length = int(self.headers.get("Content-Length", 0))
-            try:
-                data   = json.loads(self.rfile.read(length))
-                vm     = str(data.get("vm", "management"))[:64]
-                script = str(data.get("script", ""))[:8192]
-            except Exception:
+            data = self._read_json_body(MAX_API_BODY)
+            if data is None:
                 self._json(400, {"ok": False, "output": "Bad request."}); return
+            vm     = str(data.get("vm", "management"))[:64]
+            script = str(data.get("script", ""))[:8192]
             fleet     = load_json(TOOLS_DIR / "fleet.json") or {"vms": []}
             fleet_vms = {v.get("name") for v in fleet.get("vms", []) if v.get("name")}
             fleet_vms.add("management")
@@ -1586,14 +1619,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/service-control":
             if not _is_authed(self):
                 self._json(403, {"ok": False, "output": "Not authenticated."}); return
-            length = int(self.headers.get("Content-Length", 0))
-            try:
-                data    = json.loads(self.rfile.read(length))
-                vm      = str(data.get("vm", ""))[:64]
-                service = str(data.get("service", ""))[:64]
-                action  = str(data.get("action", ""))[:16]
-            except Exception:
+            data = self._read_json_body(MAX_API_BODY)
+            if data is None:
                 self._json(400, {"ok": False, "output": "Bad request."}); return
+            vm      = str(data.get("vm", ""))[:64]
+            service = str(data.get("service", ""))[:64]
+            action  = str(data.get("action", ""))[:16]
             fleet     = load_json(TOOLS_DIR / "fleet.json") or {"vms": []}
             fleet_vms = {v.get("name") for v in fleet.get("vms", []) if v.get("name")}
             fleet_vms.add("management")
@@ -1606,15 +1637,17 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/enqueue":
             if not _is_api_authed(self):
                 self._json(403, {"ok": False, "output": "Not authenticated."}); return
-            length = int(self.headers.get("Content-Length", 0))
+            data = self._read_json_body(MAX_API_BODY)
+            if data is None:
+                self._json(400, {"ok": False, "output": "Bad request."}); return
             try:
-                data     = json.loads(self.rfile.read(length))
-                vm       = str(data.get("vm", "management"))[:64]
-                label    = str(data.get("label", "API job"))[:200]
-                command  = str(data.get("command", ""))[:4096]
                 priority = int(data.get("priority", 5))
             except Exception:
-                self._json(400, {"ok": False, "output": "Bad request."}); return
+                self._json(400, {"ok": False, "output": "Bad priority."}); return
+            priority = max(1, min(priority, 100))
+            vm       = str(data.get("vm", "management"))[:64]
+            label    = str(data.get("label", "API job"))[:200]
+            command  = str(data.get("command", ""))[:4096]
             if not command.strip():
                 self._json(400, {"ok": False, "output": "command required"}); return
             fleet     = load_json(TOOLS_DIR / "fleet.json") or {"vms": []}
@@ -1632,32 +1665,33 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"ok": ok, "output": out}); return
 
         if path == "/heartbeat":
-            length = int(self.headers.get("Content-Length", 0))
-            body   = self.rfile.read(length)
-            try:
-                data = json.loads(body)
-                vm   = str(data.get("vm", ""))[:64]
-                if vm:
-                    now = datetime.now(timezone.utc).isoformat()
-                    with _hb_lock:
-                        existing = _heartbeats.get(vm, {"events": []})
-                        existing["received_at"] = now
-                        existing["uptime"]      = str(data.get("uptime", ""))[:80]
-                        ev = data.get("event")
-                        if ev:
-                            existing.setdefault("events", []).append(
-                                {"received_at": now, "event": str(ev)[:200]}
-                            )
-                            existing["events"] = existing["events"][-50:]
-                        _heartbeats[vm] = existing
-                    save_heartbeats()
-            except Exception:
-                pass
+            if not _is_heartbeat_authed(self):
+                self._json(403, {"ok": False}); return
+            data = self._read_json_body(MAX_HEARTBEAT_BODY)
+            if data is None:
+                self._json(400, {"ok": False}); return
+            vm = str(data.get("vm") or data.get("vm_name") or "")[:64]
+            if vm:
+                now = datetime.now(timezone.utc).isoformat()
+                with _hb_lock:
+                    existing = _heartbeats.get(vm, {"events": []})
+                    existing["received_at"] = now
+                    existing["uptime"]      = str(data.get("uptime", ""))[:80]
+                    ev = data.get("event")
+                    if ev:
+                        existing.setdefault("events", []).append(
+                            {"received_at": now, "event": str(ev)[:200]}
+                        )
+                        existing["events"] = existing["events"][-50:]
+                    _heartbeats[vm] = existing
+                save_heartbeats()
             self._json(200, {"ok": True}); return
 
         if path == "/login":
-            length  = int(self.headers.get("Content-Length", 0))
-            body    = self.rfile.read(length).decode("utf-8", errors="replace")
+            raw_body = self._read_body(MAX_LOGIN_BODY)
+            if raw_body is None:
+                self._html(400, login_page(error=True)); return
+            body    = raw_body.decode("utf-8", errors="replace")
             fields  = parse_qs(body)
             uname   = fields.get("username", [""])[0].strip()
             pw      = fields.get("password", [""])[0]
@@ -1670,7 +1704,7 @@ class Handler(BaseHTTPRequestHandler):
                 sid = _create_session()
                 self._redirect("/",
                     f'{COOKIE_NAME}={sid}; Max-Age={SESSION_DURATION}; '
-                    f'Path=/; HttpOnly; SameSite=Strict')
+                    f'Path=/; HttpOnly; Secure; SameSite=Strict')
             else:
                 _record_fail(client)
                 self._html(401, login_page(error=True))
@@ -1695,6 +1729,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(body)
 

@@ -19,6 +19,7 @@ import hashlib
 import os
 import re
 import secrets
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -54,6 +55,28 @@ def expand(value: str, env: dict[str, str]) -> str:
     return os.path.expandvars(value)
 
 
+def q(value: str) -> str:
+    return shlex.quote(value)
+
+
+def clone_url_for_script(repo: str, token: str) -> str:
+    repo = repo.strip()
+    if not repo:
+        return ""
+    if repo.startswith("git@") or repo.startswith("ssh://"):
+        return repo
+    if repo.startswith("https://"):
+        if token and repo.startswith("https://github.com/"):
+            return repo.replace("https://github.com/", f"https://oauth2:{token}@github.com/", 1)
+        return repo
+    repo_path = repo
+    if repo_path.endswith(".git"):
+        repo_path = repo_path[:-4]
+    if token:
+        return f"https://oauth2:{token}@github.com/{repo_path}.git"
+    return f"https://github.com/{repo_path}.git"
+
+
 def build_script(env: dict[str, str]) -> str:
     token        = env.get("GITHUB_TOKEN", "")
     repo         = env.get("FLEET_REPO", "")
@@ -63,22 +86,24 @@ def build_script(env: dict[str, str]) -> str:
     admin_domain = env.get("ADMIN_DOMAIN", "")
     admin_user   = env.get("ADMIN_USERNAME", "admin")
     admin_pass   = env.get("ADMIN_PASSWORD", "")
+    admin_hash   = env.get("ADMIN_PASSWORD_HASH", "")
     fleet_name   = env.get("FLEET_NAME", "cloud-lab")
+    queue_key    = env.get("QUEUE_API_KEY", "")
+    heartbeat    = env.get("FLEET_HEARTBEAT_TOKEN", "")
 
     missing = [k for k, v in [
-        ("GITHUB_TOKEN",       token),
         ("FLEET_REPO",         repo),
         ("OCI_COMPARTMENT_ID", compartment),
-        ("NOTIFY_NTFY_TOPIC",  ntfy),
         ("ADMIN_DOMAIN",       admin_domain),
-        ("ADMIN_PASSWORD",     admin_pass),
     ] if not v]
+    if not admin_hash and not admin_pass:
+        missing.append("ADMIN_PASSWORD_HASH")
     if missing:
         raise SystemExit(f"Missing required values in .env: {', '.join(missing)}")
 
-    # Hash locally — plaintext never sent to VM.
-    pw_hash = hash_password(admin_pass)
-    clone_url = f"https://oauth2:{token}@github.com/{repo}.git"
+    # Prefer a precomputed hash. If plaintext is supplied, hash locally before sending.
+    pw_hash = admin_hash or hash_password(admin_pass)
+    clone_url = clone_url_for_script(repo, token)
 
     return f"""set -euo pipefail
 
@@ -107,12 +132,12 @@ echo "[bootstrap] Cloning or updating fleet repo..."
 if [ -d "$HOME/cloud-lab/.git" ]; then
     git -C "$HOME/cloud-lab" pull --ff-only
 else
-    git clone {clone_url} "$HOME/cloud-lab"
+    git clone {q(clone_url)} "$HOME/cloud-lab"
 fi
 
 echo "[bootstrap] Generating fleet SSH keypair..."
 if [ ! -f "$HOME/.ssh/fleet.key" ]; then
-    ssh-keygen -t ed25519 -f "$HOME/.ssh/fleet.key" -N "" -C "{fleet_name}-fleet"
+    ssh-keygen -t ed25519 -f "$HOME/.ssh/fleet.key" -N "" -C {q(fleet_name + "-fleet")}
 fi
 
 echo "[bootstrap] Patching management config..."
@@ -139,22 +164,24 @@ force_key() {{
 }}
 
 patch_key OCI_AUTH_MODE                instance_principal
-patch_key OCI_COMPARTMENT_ID           {compartment}
-patch_key OCI_SUBNET_ID                {subnet}
-patch_key NOTIFY_NTFY_TOPIC            {ntfy}
-patch_key GITHUB_TOKEN                 {token}
-patch_key FLEET_REPO                   {repo}
-patch_key FLEET_NAME                   {fleet_name}
+patch_key OCI_COMPARTMENT_ID           {q(compartment)}
+patch_key OCI_SUBNET_ID                {q(subnet)}
+patch_key NOTIFY_NTFY_TOPIC            {q(ntfy)}
+patch_key GITHUB_TOKEN                 {q(token)}
+patch_key FLEET_REPO                   {q(repo)}
+patch_key FLEET_NAME                   {q(fleet_name)}
 patch_key FLEET_VM_NAME                management
-patch_key ADMIN_DOMAIN                 {admin_domain}
+patch_key ADMIN_DOMAIN                 {q(admin_domain)}
 patch_key ADMIN_CONSOLE_HOST           0.0.0.0
+patch_key QUEUE_API_KEY                {q(queue_key)}
+patch_key FLEET_HEARTBEAT_TOKEN        {q(heartbeat)}
 patch_key OCI_SSH_PUBLIC_KEY_PATH      "$HOME/.ssh/fleet.key.pub"
 patch_key OCI_SSH_PRIVATE_KEY_PATH     "$HOME/.ssh/fleet.key"
 patch_key OCI_SSH_USER                 ubuntu
 
 force_key FLEET_MANAGEMENT_PRIVATE_IP  "$MGMT_PRIVATE_IP"
-force_key ADMIN_USERNAME               {admin_user}
-force_key ADMIN_PASSWORD_HASH          {pw_hash}
+force_key ADMIN_USERNAME               {q(admin_user)}
+force_key ADMIN_PASSWORD_HASH          {q(pw_hash)}
 
 echo "[bootstrap] Running role setup..."
 TOOLS_DIR="$HOME/cloud-lab" bash "$HOME/cloud-lab/fleet/management/setup.sh"
@@ -220,7 +247,7 @@ def main() -> int:
     if dry_run:
         print("-- DRY RUN -- script that would run on the VM --")
         redacted = script
-        for key in ("GITHUB_TOKEN", "ADMIN_PASSWORD", "NOTIFY_NTFY_TOPIC"):
+        for key in ("GITHUB_TOKEN", "ADMIN_PASSWORD", "NOTIFY_NTFY_TOPIC", "QUEUE_API_KEY", "FLEET_HEARTBEAT_TOKEN"):
             val = env.get(key, "")
             if val:
                 redacted = redacted.replace(val, f"***{key}***")

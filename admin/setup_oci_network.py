@@ -7,7 +7,7 @@ security list, and instance-principal IAM policy needed before
 the management VM can orchestrate the rest of the fleet.
 
 Safe to re-run — skips resources that already exist.
-Prints the values you need to add to oracle-tools/.env when done.
+Prints the values you need to add to .env when done.
 
 Usage:
   setup-oci-network.bat
@@ -25,7 +25,7 @@ import sys
 from pathlib import Path
 
 
-ROOT     = Path(__file__).resolve().parent.parent   # oracle-tools/
+ROOT     = Path(__file__).resolve().parent.parent   # repo root
 ENV_FILE = ROOT / ".env"
 
 VCN_CIDR    = "10.0.0.0/16"
@@ -180,7 +180,9 @@ def ensure_instance_principal_iam(tenancy_id: str, compartment_id: str, dry_run:
 
     matching_rule = f"ALL {{instance.compartment.id = '{compartment_id}'}}"
     statements = json.dumps([
-        f"Allow dynamic-group {DG_NAME} to manage all-resources in compartment id {compartment_id}"
+        f"Allow dynamic-group {DG_NAME} to manage instance-family in compartment id {compartment_id}",
+        f"Allow dynamic-group {DG_NAME} to use virtual-network-family in compartment id {compartment_id}",
+        f"Allow dynamic-group {DG_NAME} to inspect all-resources in compartment id {compartment_id}",
     ])
 
     print("Checking instance-principal dynamic group...")
@@ -243,7 +245,7 @@ def main() -> int:
 
     compartment_id = env.get("OCI_COMPARTMENT_ID", "").strip()
     if not compartment_id:
-        print("Error: OCI_COMPARTMENT_ID not set in oracle-tools/.env")
+        print("Error: OCI_COMPARTMENT_ID not set in .env")
         return 1
 
     if dry_run:
@@ -412,7 +414,7 @@ def main() -> int:
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print("\n" + "─" * 60)
-    print("Network setup complete. Add these to oracle-tools/.env:\n")
+    print("Network setup complete. Add these to .env:\n")
     print(f"OCI_SUBNET_ID={subnet_id}")
     print(f"OCI_AVAILABILITY_DOMAIN={ad}")
     print()

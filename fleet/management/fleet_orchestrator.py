@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -141,6 +142,19 @@ def wait_for_ssh(public_ip: str, key_path: Path, user: str = "ubuntu") -> bool:
     return False
 
 
+def clone_url(repo: str, token: str) -> tuple[str, str]:
+    repo = repo.strip()
+    if repo.startswith("git@") or repo.startswith("ssh://"):
+        return repo, repo
+    if repo.startswith("https://"):
+        clean = repo
+    else:
+        clean = f"https://github.com/{repo.removesuffix('.git')}.git"
+    if token and clean.startswith("https://github.com/"):
+        return clean.replace("https://github.com/", f"https://oauth2:{token}@github.com/", 1), clean
+    return clean, clean
+
+
 def run_first_contact(public_ip: str, vm_name: str, role: str, env: dict[str, str]) -> bool:
     """Bootstrap a freshly launched VM: git clone + write .env + run role setup."""
     key_path = Path(env.get("OCI_SSH_PRIVATE_KEY_PATH", "~/.ssh/fleet.key")).expanduser()
@@ -155,12 +169,13 @@ def run_first_contact(public_ip: str, vm_name: str, role: str, env: dict[str, st
     mgmt_priv_ip  = env.get("FLEET_MANAGEMENT_PRIVATE_IP", "")
     ntfy_topic    = env.get("NOTIFY_NTFY_TOPIC", "")
     fleet_name    = env.get("FLEET_NAME", "cloud-lab")
+    heartbeat     = env.get("FLEET_HEARTBEAT_TOKEN", "")
 
-    if not github_token or not repo:
-        log("ERROR: GITHUB_TOKEN or FLEET_REPO not set — cannot run first-contact.")
+    if not repo:
+        log("ERROR: FLEET_REPO not set — cannot run first-contact.")
         return False
 
-    clone_url = f"https://oauth2:{github_token}@github.com/{repo}.git"
+    auth_clone_url, clean_clone_url = clone_url(repo, github_token)
 
     vm_env_lines = [
         "OCI_AUTH_MODE=instance_principal",
@@ -171,13 +186,15 @@ def run_first_contact(public_ip: str, vm_name: str, role: str, env: dict[str, st
         f"FLEET_REPO={repo}",
         f"FLEET_NAME={fleet_name}",
         f"FLEET_VM_NAME={vm_name}",
+        f"FLEET_HEARTBEAT_TOKEN={heartbeat}",
     ]
     vm_env = "\n".join(vm_env_lines)
 
     bootstrap = f"""set -euo pipefail
 sudo apt-get update -qq
 sudo apt-get install -y -qq ca-certificates curl git jq python3 python3-venv tmux unzip
-git clone {clone_url} $HOME/cloud-lab || (cd $HOME/cloud-lab && git pull --ff-only)
+git clone {shlex.quote(auth_clone_url)} $HOME/cloud-lab || (cd $HOME/cloud-lab && git pull --ff-only)
+git -C $HOME/cloud-lab remote set-url origin {shlex.quote(clean_clone_url)} || true
 mkdir -p $HOME/.config/cloud-lab
 printf '%s\\n' {repr(vm_env)} > $HOME/.config/cloud-lab/{role}.env
 chmod 600 $HOME/.config/cloud-lab/{role}.env

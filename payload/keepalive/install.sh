@@ -8,7 +8,7 @@
 #   - Daily 6:00: fleet_report.py  — full fleet status via ntfy
 #
 # Role-specific jobs (Oracle idle-reclamation protection):
-#   worker:     Weekly Sunday 04:00 — apt update+upgrade (real I/O + CPU)
+#   worker:     Weekly Sunday 04:00 — apt metadata refresh + cache cleanup
 #   laboratory: Weekly Sunday 04:30 — compression benchmark (real CPU burst)
 #
 # Oracle reclaims Always Free VMs with <~10% average CPU over 7 days.
@@ -40,9 +40,9 @@ fi
 VM_NAME="${VM_NAME:-${FLEET_VM_NAME:-}}"
 
 if [[ "$VM_NAME" == "worker" ]]; then
-    # Weekly apt update+upgrade: real package I/O and occasional compilation.
-    add_cron "0 4 * * 0 sudo apt-get update -q && sudo apt-get upgrade -y -q >> $HOME/cloud-lab/logs/keepalive.log 2>&1"
-    echo "[keepalive] Worker role: added weekly apt update+upgrade (Sun 04:00)"
+    # Weekly apt metadata refresh and cache cleanup: real I/O without unattended upgrades.
+    add_cron "0 4 * * 0 sudo apt-get update -q && sudo apt-get autoclean -q >> $HOME/cloud-lab/logs/keepalive.log 2>&1"
+    echo "[keepalive] Worker role: added weekly apt update/autoclean (Sun 04:00)"
 fi
 
 if [[ "$VM_NAME" == "laboratory" ]]; then

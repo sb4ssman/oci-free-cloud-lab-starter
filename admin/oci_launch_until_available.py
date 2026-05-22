@@ -302,7 +302,7 @@ def _hash_password(password: str) -> str:
 def build_user_data(config: dict[str, Any], env: dict[str, str]) -> str | None:
     """Return a cloud-init user-data script string, or None if no template is configured.
 
-    config['cloud_init_template'] is a path relative to oracle-tools/ root, or absolute.
+    config['cloud_init_template'] is a path relative to the repo root, or absolute.
     ${VAR} placeholders are substituted from env at render time — secrets never appear
     in profile JSON or git history.
 
@@ -315,7 +315,7 @@ def build_user_data(config: dict[str, Any], env: dict[str, str]) -> str | None:
 
     template_path = expand_path(str(template_value))
     if not template_path.is_absolute():
-        template_path = ROOT.parent / template_path   # relative to oracle-tools/
+        template_path = ROOT.parent / template_path   # relative to repo root
     if not template_path.exists():
         raise RetryError(f"cloud_init_template not found: {template_path}")
 
@@ -323,19 +323,9 @@ def build_user_data(config: dict[str, Any], env: dict[str, str]) -> str | None:
 
     # Augment env with derived values before substitution.
     env = dict(env)
-    if "ADMIN_PASSWORD" in env and "ADMIN_PASSWORD_HASH" not in env:
+    if env.get("ADMIN_PASSWORD") and not env.get("ADMIN_PASSWORD_HASH"):
         env["ADMIN_PASSWORD_HASH"] = _hash_password(env["ADMIN_PASSWORD"])
-    for optional_key in (
-        "DASHBOARD_DATABASE_URL",
-        "DASHBOARD_SCHWAB_APP_KEY",
-        "DASHBOARD_SCHWAB_APP_SECRET",
-        "DASHBOARD_SCHWAB_MARKET_APP_KEY",
-        "DASHBOARD_SCHWAB_MARKET_APP_SECRET",
-        "DASHBOARD_PLAID_CLIENT_ID",
-        "DASHBOARD_PLAID_SECRET",
-        "DASHBOARD_PLAID_ENV",
-        "DASHBOARD_COINGECKO_API_KEY",
-    ):
+    for optional_key in ("GITHUB_TOKEN", "QUEUE_API_KEY", "FLEET_HEARTBEAT_TOKEN"):
         env.setdefault(optional_key, "")
 
     # Simple ${VAR} substitution from env. Unknown placeholders are left as-is.

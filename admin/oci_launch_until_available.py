@@ -427,6 +427,23 @@ def find_active_instance(config: dict[str, Any]) -> dict[str, Any] | None:
     return resource_search_instance(config)
 
 
+def get_instance_shape(config: dict[str, Any], instance_id: str) -> str:
+    """Return the shape string for an existing instance, or '' on failure."""
+    try:
+        data = run_oci_json(
+            ["compute", "instance", "get", "--instance-id", instance_id],
+            auth_mode=config["oci_auth"],
+            timeout_seconds=60,
+            heartbeat_seconds=0,
+            label="Instance shape lookup",
+            verbose=False,
+        )
+        return data.get("data", {}).get("shape", "")
+    except Exception as exc:
+        log(f"Could not read instance shape for {instance_id}: {exc}")
+        return ""
+
+
 def instance_already_active(config: dict[str, Any]) -> bool:
     """Return True if an instance with this display name already exists."""
     item = find_active_instance(config)
@@ -615,6 +632,46 @@ def notify_success(config: dict[str, Any], env: dict[str, str], console_url: str
         webbrowser.open(console_url)
 
 
+def _attempt_shape_conversion(
+    config: dict[str, Any],
+    instance_id: str,
+    shape_cfg: dict,
+    max_retries: int,
+) -> bool:
+    """Try to convert instance_id to VM.Standard.A1.Flex. Returns True on success."""
+    handle = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8")
+    shape_temp = Path(handle.name)
+    try:
+        with handle:
+            json.dump(shape_cfg, handle)
+        for conv_attempt in range(1, max_retries + 1):
+            log(f"Shape conversion attempt {conv_attempt}/{max_retries}: "
+                f"→ VM.Standard.A1.Flex ({config['ocpus']} OCPU / {config['memory_in_gbs']} GB)...")
+            code, stdout, stderr, _ = run_oci(
+                ["compute", "instance", "update",
+                 "--instance-id", instance_id,
+                 "--shape", "VM.Standard.A1.Flex",
+                 "--shape-config", f"file://{shape_temp}",
+                 "--force"],
+                auth_mode=config["oci_auth"],
+                timeout_seconds=60,
+                heartbeat_seconds=15,
+                label=f"Shape conversion ({conv_attempt}/{max_retries})",
+            )
+            if code == 0:
+                log(f"Shape conversion succeeded — {instance_id} is now VM.Standard.A1.Flex.")
+                log("IMPORTANT: This instance has no cloud-init setup. "
+                    "Run bootstrap after the VM is RUNNING to install fleet services.")
+                return True
+            text = (stdout + " " + stderr).strip()
+            log(f"Conversion attempt {conv_attempt} failed: {text[:300]}")
+            if conv_attempt < max_retries:
+                time.sleep(10)
+        return False
+    finally:
+        shape_temp.unlink(missing_ok=True)
+
+
 def _a2_terminate(instance_id: str, auth_mode: str) -> None:
     """Best-effort A2.Flex termination. Logs a manual command if it fails."""
     try:
@@ -694,7 +751,6 @@ def a2_to_a1_conversion_attempt(config: dict[str, Any], env: dict[str, str]) -> 
     for launch_attempt in range(1, a2_max_launch + 1):
         log(f"A2 launch attempt {launch_attempt}/{a2_max_launch}...")
         instance_id: str | None = None
-        shape_temp: Path | None = None
 
         try:
             args, temp_files = launch_args(a2_config, image_id, ad, env)
@@ -739,50 +795,13 @@ def a2_to_a1_conversion_attempt(config: dict[str, Any], env: dict[str, str]) -> 
             # Brief pause — let Oracle register the instance before a shape update.
             time.sleep(5)
 
-            # Attempt shape conversion, with retries.
-            handle = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8")
-            shape_temp = Path(handle.name)
-            with handle:
-                json.dump(shape_cfg, handle)
-
-            converted = False
-            for conv_attempt in range(1, a2_conv_retries + 1):
-                log(f"Shape conversion attempt {conv_attempt}/{a2_conv_retries}: "
-                    f"A2.Flex → A1.Flex ({config['ocpus']} OCPU / {config['memory_in_gbs']} GB)...")
-                code, stdout, stderr, _ = run_oci(
-                    ["compute", "instance", "update",
-                     "--instance-id", instance_id,
-                     "--shape", "VM.Standard.A1.Flex",
-                     "--shape-config", f"file://{shape_temp}",
-                     "--force"],
-                    auth_mode=config["oci_auth"],
-                    timeout_seconds=60,
-                    heartbeat_seconds=15,
-                    label=f"Shape conversion A2→A1 ({conv_attempt}/{a2_conv_retries})",
-                )
-                if code == 0:
-                    log(f"Shape conversion succeeded — {instance_id} is now VM.Standard.A1.Flex.")
-                    log("IMPORTANT: This instance has no cloud-init setup. "
-                        "Run bootstrap-mgmt-vm (or its worker equivalent) after the VM is RUNNING "
-                        "to install fleet services.")
-                    converted = True
-                    break
-                text = (stdout + " " + stderr).strip()
-                log(f"Conversion attempt {conv_attempt} failed: {text[:300]}")
-                if conv_attempt < a2_conv_retries:
-                    time.sleep(10)
-
-            if converted:
+            if _attempt_shape_conversion(config, instance_id, shape_cfg, a2_conv_retries):
                 return instance_id
 
             log(f"All {a2_conv_retries} conversion attempts failed.")
 
         except Exception as exc:
             log(f"A2→A1 attempt error: {exc}")
-
-        finally:
-            if shape_temp:
-                shape_temp.unlink(missing_ok=True)
 
         if instance_id:
             log(f"Terminating A2.Flex {instance_id} to avoid charges...")
@@ -815,12 +834,31 @@ def retry(config: dict[str, Any], env: dict[str, str]) -> int:
 
     oci_connectivity_probe(config)
 
-    if instance_already_active(config):
-        item = find_active_instance(config)
-        if item and item.get("id"):
-            public_ip = wait_for_public_ip(config, item["id"], timeout_seconds=60)
+    existing = find_active_instance(config)
+    if existing and existing.get("id"):
+        existing_id = existing["id"]
+        existing_shape = get_instance_shape(config, existing_id)
+        if existing_shape == config["shape"]:
+            log(f"Pre-flight: '{config['instance_display_name']}' already exists as "
+                f"{existing_shape} ({existing.get('lifecycle-state', 'UNKNOWN')}) — done.")
+            public_ip = wait_for_public_ip(config, existing_id, timeout_seconds=60)
             update_duckdns(env, public_ip)
-        return 0
+            return 0
+        elif existing_shape == "VM.Standard.A2.Flex":
+            log(f"Pre-flight: found stranded A2.Flex '{config['instance_display_name']}' "
+                f"({existing_id}) — attempting shape conversion before proceeding...")
+            shape_cfg = {"ocpus": float(config["ocpus"]), "memoryInGBs": float(config["memory_in_gbs"])}
+            a2_conv_retries = int(config.get("a2_conversion_retries", 3))
+            if _attempt_shape_conversion(config, existing_id, shape_cfg, a2_conv_retries):
+                console_url = f"https://cloud.oracle.com/compute/instances/{existing_id}"
+                return finish_success(config, env, existing_id, console_url)
+            log("Conversion of stranded A2.Flex failed. Terminating it and proceeding...")
+            _a2_terminate(existing_id, config["oci_auth"])
+        else:
+            log(f"Pre-flight: '{config['instance_display_name']}' exists as "
+                f"'{existing_shape or 'unknown shape'}' "
+                f"({existing.get('lifecycle-state', 'UNKNOWN')}) — skipping launch.")
+            return 0
 
     # Pre-flight: attempt A2.Flex → A1.Flex shape conversion before the standard lottery.
     conversion_id = a2_to_a1_conversion_attempt(config, env)

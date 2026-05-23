@@ -42,6 +42,7 @@ PORT       = int(os.getenv("ADMIN_CONSOLE_PORT", "8765"))
 USERNAME   = os.getenv("ADMIN_USERNAME", "admin")
 PW_HASH    = os.getenv("ADMIN_PASSWORD_HASH", "")
 FLEET_NAME = os.getenv("FLEET_NAME", "Cloud Lab")
+DEV_MODE   = os.getenv("DEV_MODE", "") == "1" or "--dev" in __import__("sys").argv
 TOOLS_DIR  = Path(os.getenv("CLOUD_LAB_DIR",
              str(Path.home() / "cloud-lab"))).expanduser()
 PROFILE_DIR     = TOOLS_DIR / "vm-profiles"
@@ -126,6 +127,8 @@ def _create_session() -> str:
 
 
 def _is_authed(handler: BaseHTTPRequestHandler) -> bool:
+    if DEV_MODE:
+        return True
     cookies = _parse_cookies(handler.headers.get("Cookie", ""))
     sid = cookies.get(COOKIE_NAME, "")
     if not sid:
@@ -1547,8 +1550,12 @@ class Handler(BaseHTTPRequestHandler):
         qs     = parse_qs(parsed.query)
 
         if path == "/login":
+            if DEV_MODE:
+                self._redirect("/"); return
             self._html(200, login_page()); return
         if path == "/logout":
+            if DEV_MODE:
+                self._redirect("/"); return
             self._redirect("/login",
                            f'{COOKIE_NAME}=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Strict')
             return

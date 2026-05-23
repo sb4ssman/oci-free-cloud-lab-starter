@@ -184,24 +184,6 @@ as a TLS-terminating reverse proxy in front of the admin console.
 
 ---
 
-## What's automated vs. what you do manually
-
-| Done for you automatically | You do this manually |
-|---|---|
-| All VM provisioning after management is up | Run `setup-oci-network` (once) |
-| Repo clone + updates on each VM | Run `launch-management` (once) |
-| All systemd service installation | Edit `.env` with your credentials |
-| Fleet SSH key generation on management VM | Update DuckDNS record after management VM launches |
-| TLS cert provisioning via Caddy + Let's Encrypt | Fill in `OCI_*_HOST` in `.env` as VMs come online |
-| Peer health monitoring across all VMs | Wait for A1 Flex capacity if A2→A1 conversion is unavailable |
-| A2→A1 shape conversion attempt (trial/PAYG), then A1 retry lottery | — |
-| Self-healing: management relaunches worker and laboratory | — |
-| Self-healing: worker relaunches management (and lab if management is also gone) | — |
-| Self-healing: laboratory relaunches management when both mgmt + worker are down | — |
-| Keepalive: periodic CPU activity to prevent idle reclamation | — |
-| Resource alerts: ntfy if disk >80%, RAM <10%, or load spikes | — |
-
----
 
 ## Oracle Always Free — what you need to know
 

@@ -615,6 +615,187 @@ def notify_success(config: dict[str, Any], env: dict[str, str], console_url: str
         webbrowser.open(console_url)
 
 
+def _a2_terminate(instance_id: str, auth_mode: str) -> None:
+    """Best-effort A2.Flex termination. Logs a manual command if it fails."""
+    try:
+        run_oci(
+            ["compute", "instance", "terminate",
+             "--instance-id", instance_id,
+             "--preserve-boot-volume", "false",
+             "--force"],
+            auth_mode=auth_mode,
+            timeout_seconds=60,
+            heartbeat_seconds=0,
+            label="A2.Flex cleanup",
+            verbose=False,
+        )
+        log(f"A2.Flex {instance_id} terminated.")
+    except Exception as exc:
+        log(f"WARNING: could not auto-terminate {instance_id}: {exc}")
+        log(f"ACTION REQUIRED — terminate manually to avoid charges:")
+        log(f"  oci compute instance terminate --instance-id {instance_id} "
+            f"--preserve-boot-volume false --force")
+
+
+def a2_to_a1_conversion_attempt(config: dict[str, Any], env: dict[str, str]) -> str | None:
+    """
+    Pre-flight: launch VM.Standard.A2.Flex and immediately convert to VM.Standard.A1.Flex.
+
+    A2.Flex capacity is less contended than A1.Flex direct launches. The shape-update API
+    call bypasses the standard capacity queue through a different Oracle backend path.
+    Community-confirmed technique (r/oraclecloud, March 2026); not explicitly documented
+    by Oracle as a supported workflow — Oracle could revoke it without notice.
+
+    BILLING: Creating A2.Flex accrues real charges (billed to the nearest second).
+    This is appropriate for accounts in the 30-day trial window or on PAYG.
+    On a pure Always Free account (post-trial, no PAYG), the A2 launch will fail with
+    LimitExceeded and fall through harmlessly to the standard lottery.
+
+    On any failure the A2.Flex instance is terminated immediately.
+    Enabled by setting "try_a2_conversion": true in the launch profile.
+    """
+    if not config.get("try_a2_conversion"):
+        return None
+
+    a2_max_launch   = int(config.get("a2_max_launch_attempts", 2))
+    a2_conv_retries = int(config.get("a2_conversion_retries", 3))
+    a2_ocpus = float(config.get("a2_conversion_ocpus", 1))
+    a2_mem   = float(config.get("a2_conversion_memory_in_gbs", 6))
+
+    log("=== A2→A1 conversion pre-flight ===")
+    log("BILLING NOTICE: this will briefly create a VM.Standard.A2.Flex instance "
+        "(paid shape, billed per second). Cost is a fraction of a cent if conversion succeeds. "
+        "The A2.Flex is terminated immediately on any failure.")
+    log("This technique is community-discovered and not officially documented by Oracle.")
+    log(f"Attempt budget: {a2_max_launch} A2 launch(es), {a2_conv_retries} conversion(s) per launch.")
+
+    # Strip cloud-init: the shape-change reboot interrupts any in-progress cloud-init
+    # run and leaves the system in a partially-initialized state. A bare Ubuntu instance
+    # is cleaner — bootstrap it explicitly after the shape is confirmed.
+    a2_config = {**config, "shape": "VM.Standard.A2.Flex",
+                 "ocpus": a2_ocpus, "memory_in_gbs": a2_mem,
+                 "cloud_init_template": ""}
+
+    # ARM Ubuntu images are shared across A1/A2 — try A2-specific first, fall back to A1.
+    try:
+        image_id = latest_image_id(a2_config)
+    except RetryError:
+        log("No A2.Flex-specific image found; using A1.Flex image (both ARM — compatible).")
+        try:
+            image_id = latest_image_id(config)
+        except RetryError as exc:
+            log(f"Image lookup failed: {exc}. Skipping A2→A1 attempt.")
+            return None
+
+    ad = availability_domain(config)
+
+    shape_cfg = {"ocpus": float(config["ocpus"]), "memoryInGBs": float(config["memory_in_gbs"])}
+
+    for launch_attempt in range(1, a2_max_launch + 1):
+        log(f"A2 launch attempt {launch_attempt}/{a2_max_launch}...")
+        instance_id: str | None = None
+        shape_temp: Path | None = None
+
+        try:
+            args, temp_files = launch_args(a2_config, image_id, ad, env)
+            try:
+                code, stdout, stderr, _ = run_oci(
+                    args,
+                    auth_mode=config["oci_auth"],
+                    timeout_seconds=int(config["oci_timeout_seconds"]),
+                    heartbeat_seconds=int(config["oci_heartbeat_seconds"]),
+                    label=f"A2.Flex launch ({launch_attempt}/{a2_max_launch})",
+                )
+            finally:
+                for f in temp_files:
+                    for _ in range(5):
+                        try:
+                            f.unlink(missing_ok=True); break
+                        except PermissionError:
+                            time.sleep(0.5)
+
+            if code != 0:
+                text = (stdout + " " + stderr).strip()
+                if re.search(r"LimitExceeded|QuotaExceeded", text):
+                    log("A2.Flex launch rejected: account limit exceeded.")
+                    log("Your account does not support VM.Standard.A2.Flex. "
+                        "This shape requires an active 30-day trial or a Pay-As-You-Go account. "
+                        "Set \"try_a2_conversion\": false in laboratory.json to suppress this attempt, "
+                        "or upgrade your account to enable it.")
+                    return None  # Permanent — don't retry.
+                if re.search(r"NotAuthorizedOrNotFound", text):
+                    log("A2.Flex launch rejected: not authorized. "
+                        "Your account may not have access to VM.Standard.A2.Flex in this region.")
+                    return None
+                log(f"A2.Flex launch failed: {text[:400]}")
+                if launch_attempt < a2_max_launch:
+                    log(f"Retrying A2 launch in 15s...")
+                    time.sleep(15)
+                continue
+
+            instance_id = json.loads(stdout)["data"]["id"]
+            log(f"A2.Flex launched: {instance_id}")
+
+            # Brief pause — let Oracle register the instance before a shape update.
+            time.sleep(5)
+
+            # Attempt shape conversion, with retries.
+            handle = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8")
+            shape_temp = Path(handle.name)
+            with handle:
+                json.dump(shape_cfg, handle)
+
+            converted = False
+            for conv_attempt in range(1, a2_conv_retries + 1):
+                log(f"Shape conversion attempt {conv_attempt}/{a2_conv_retries}: "
+                    f"A2.Flex → A1.Flex ({config['ocpus']} OCPU / {config['memory_in_gbs']} GB)...")
+                code, stdout, stderr, _ = run_oci(
+                    ["compute", "instance", "update",
+                     "--instance-id", instance_id,
+                     "--shape", "VM.Standard.A1.Flex",
+                     "--shape-config", f"file://{shape_temp}",
+                     "--force"],
+                    auth_mode=config["oci_auth"],
+                    timeout_seconds=60,
+                    heartbeat_seconds=15,
+                    label=f"Shape conversion A2→A1 ({conv_attempt}/{a2_conv_retries})",
+                )
+                if code == 0:
+                    log(f"Shape conversion succeeded — {instance_id} is now VM.Standard.A1.Flex.")
+                    log("IMPORTANT: This instance has no cloud-init setup. "
+                        "Run bootstrap-mgmt-vm (or its worker equivalent) after the VM is RUNNING "
+                        "to install fleet services.")
+                    converted = True
+                    break
+                text = (stdout + " " + stderr).strip()
+                log(f"Conversion attempt {conv_attempt} failed: {text[:300]}")
+                if conv_attempt < a2_conv_retries:
+                    time.sleep(10)
+
+            if converted:
+                return instance_id
+
+            log(f"All {a2_conv_retries} conversion attempts failed.")
+
+        except Exception as exc:
+            log(f"A2→A1 attempt error: {exc}")
+
+        finally:
+            if shape_temp:
+                shape_temp.unlink(missing_ok=True)
+
+        if instance_id:
+            log(f"Terminating A2.Flex {instance_id} to avoid charges...")
+            _a2_terminate(instance_id, config["oci_auth"])
+
+        if launch_attempt < a2_max_launch:
+            log(f"Will retry full A2 launch in 15s...")
+            time.sleep(15)
+
+    log("A2→A1 conversion exhausted all attempts. Falling through to standard A1 lottery.")
+    return None
+
+
 def retry(config: dict[str, Any], env: dict[str, str]) -> int:
     ssh_key = expand_path(config["ssh_public_key_path"])
     config["ssh_public_key_path"] = str(ssh_key)
@@ -640,6 +821,12 @@ def retry(config: dict[str, Any], env: dict[str, str]) -> int:
             public_ip = wait_for_public_ip(config, item["id"], timeout_seconds=60)
             update_duckdns(env, public_ip)
         return 0
+
+    # Pre-flight: attempt A2.Flex → A1.Flex shape conversion before the standard lottery.
+    conversion_id = a2_to_a1_conversion_attempt(config, env)
+    if conversion_id:
+        console_url = f"https://cloud.oracle.com/compute/instances/{conversion_id}"
+        return finish_success(config, env, conversion_id, console_url)
 
     ad = availability_domain(config)
     image_id = latest_image_id(config)

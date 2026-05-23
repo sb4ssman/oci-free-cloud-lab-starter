@@ -215,6 +215,41 @@ will almost certainly return "Out of host capacity" on your first launch attempt
 fleet orchestrator retries silently and indefinitely. Most users win within 24–72 hours;
 some wait longer. There is no way to accelerate this. Leave the orchestrator running.
 
+**Faster path: A2.Flex → A1.Flex conversion.**  A community-discovered technique
+(confirmed working as of early 2026, not officially documented by Oracle) can get you
+the A1.Flex instance in minutes rather than days: launch a `VM.Standard.A2.Flex`
+instance (a different ARM shape with more available capacity), then immediately convert
+its shape to `VM.Standard.A1.Flex` via the OCI API. The conversion goes through a
+different backend path than a direct A1.Flex launch and is significantly less contended.
+
+This is enabled by default in `admin/profiles/laboratory.json`
+(`"try_a2_conversion": true`). The launcher tries it first on every run, then falls
+back to the standard lottery if it fails.
+
+**Account requirements and cost:** `VM.Standard.A2.Flex` is not an Always Free shape.
+Creating it briefly accrues charges (billed per second). This is appropriate if:
+
+- You are within your **30-day free trial window** — the brief A2 cost draws from trial
+  credits and amounts to a fraction of a cent.
+- You have a **Pay-As-You-Go account** — same fraction-of-a-cent charge.
+
+If your account is **pure Always Free** (trial expired, no PAYG), the A2 launch will
+be rejected with a `LimitExceeded` error and the launcher falls through harmlessly to
+the standard lottery. No charge, no action needed. The log will tell you explicitly
+if this happens.
+
+**A2.Flex does not count against your 2-micro limit.** It is a separate shape family
+with its own quota. Your existing management and worker VMs are unaffected.
+
+**After a successful conversion**, the laboratory instance is bare Ubuntu — the
+shape-change reboot interrupts cloud-init. Bootstrap the VM immediately:
+```bash
+bash admin/ssh-vm.sh laboratory   # then run your setup script
+```
+
+To disable the A2 conversion attempt entirely (standard lottery only), set
+`"try_a2_conversion": false` in `admin/profiles/laboratory.json`.
+
 **The 2-micro limit.**  Always Free includes exactly 2 `VM.Standard.E2.1.Micro`
 instances total. `management` and `worker` each use one. If you terminate both and
 try to relaunch simultaneously, Oracle may reject the second. Launch sequentially or

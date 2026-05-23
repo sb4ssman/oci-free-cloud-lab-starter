@@ -957,7 +957,7 @@ _PAYLOAD_PRESETS: list[tuple[str, str, str, str]] = [
         "update-repo",
         "Update repo",
         "Pull latest code from origin and restart all services",
-        "cd ~/cloud-lab && git pull --ff-only && sudo systemctl restart 'cloud-lab-*'",
+        "set -euo pipefail\ngit -C \"$CLOUD_LAB_DIR\" pull --ff-only\nsudo systemctl daemon-reload 2>/dev/null || true\nsudo systemctl restart 'cloud-lab-*'\necho 'Update complete.'",
     ),
     (
         "apt-maintenance",
@@ -1035,8 +1035,10 @@ def _topbar(active: str = "") -> str:
     return (
         f'<div class="topbar">'
         f'<div class="topbar-left">'
+        f'<a href="/" style="display:flex;align-items:center;gap:10px;text-decoration:none">'
         f'<img id="topbar-logo" class="topbar-logo" alt="Fleet Logo">'
         f'<span class="fleet-name">{html.escape(FLEET_NAME)}</span>'
+        f'</a>'
         f'</div>'
         f'<nav class="topbar-nav">{links}'
         f'<button class="theme-btn" title="Appearance" onclick="toggleSettings()">&#9881;</button>'
@@ -1292,6 +1294,14 @@ def export_page() -> bytes:
 # ── tools page ───────────────────────────────────────────────────────────────
 
 def run_payload_on_vm(vm_name: str, script: str) -> tuple[bool, str]:
+    # Inject CLOUD_LAB_DIR so scripts never need to hardcode the repo path.
+    # Management: the console's actual TOOLS_DIR. Other VMs: cloud-init standard.
+    if vm_name == "management":
+        header = f"export CLOUD_LAB_DIR={shlex.quote(str(TOOLS_DIR))}\n"
+    else:
+        header = 'export CLOUD_LAB_DIR="$HOME/cloud-lab"\n'
+    script = header + script
+
     if vm_name == "management":
         try:
             result = subprocess.run(
@@ -1675,7 +1685,7 @@ class Handler(BaseHTTPRequestHandler):
             if vm not in fleet_vms:
                 self._json(400, {"ok": False, "output": f"Unknown VM: {vm}"}); return
             enq_cmd = (
-                f"python3 ~/cloud-lab/payload/queue/queue_runner.py "
+                f"python3 \"$CLOUD_LAB_DIR/payload/queue/queue_runner.py\" "
                 f"--enqueue --label {shlex.quote(label)} "
                 f"--command {shlex.quote(command)} --priority {priority}"
             )

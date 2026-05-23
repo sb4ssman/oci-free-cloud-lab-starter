@@ -193,8 +193,8 @@ as a TLS-terminating reverse proxy in front of the admin console.
 | All systemd service installation | Edit `.env` with your credentials |
 | Fleet SSH key generation on management VM | Update DuckDNS record after management VM launches |
 | TLS cert provisioning via Caddy + Let's Encrypt | Fill in `OCI_*_HOST` in `.env` as VMs come online |
-| Peer health monitoring across all VMs | Wait for A1 Flex capacity (hours to days — out of your hands) |
-| A1 Flex retry loop until capacity granted | — |
+| Peer health monitoring across all VMs | Wait for A1 Flex capacity if A2→A1 conversion is unavailable |
+| A2→A1 shape conversion attempt (trial/PAYG), then A1 retry lottery | — |
 | Self-healing: management relaunches worker and laboratory | — |
 | Self-healing: worker relaunches management (and lab if management is also gone) | — |
 | Self-healing: laboratory relaunches management when both mgmt + worker are down | — |
@@ -210,45 +210,42 @@ idle (CPU below roughly 10% over 7 days). This repo solves it with real operatio
 work — health checks, log compression, OCI API calls via cron — rather than fake load.
 The keepalive payload (`payload/keepalive/`) handles this automatically on every VM.
 
-**The A1 Flex lottery.**  `VM.Standard.A1.Flex` is perpetually oversubscribed. Oracle
-will almost certainly return "Out of host capacity" on your first launch attempt. The
-fleet orchestrator retries silently and indefinitely. Most users win within 24–72 hours;
-some wait longer. There is no way to accelerate this. Leave the orchestrator running.
+**Getting the A1.Flex instance.**  `VM.Standard.A1.Flex` is perpetually oversubscribed
+in most regions. Oracle frequently returns "Out of host capacity" on direct launch
+attempts. The launcher handles this two ways, in order:
 
-**Faster path: A2.Flex → A1.Flex conversion.**  A community-discovered technique
-(confirmed working as of early 2026, not officially documented by Oracle) can get you
-the A1.Flex instance in minutes rather than days: launch a `VM.Standard.A2.Flex`
-instance (a different ARM shape with more available capacity), then immediately convert
-its shape to `VM.Standard.A1.Flex` via the OCI API. The conversion goes through a
-different backend path than a direct A1.Flex launch and is significantly less contended.
+1. **A2→A1 shape conversion** *(trial window or PAYG accounts only)* — launches a
+   `VM.Standard.A2.Flex` instance first (a different ARM shape with better capacity
+   availability), then immediately converts its shape to `VM.Standard.A1.Flex` via the
+   OCI API. This bypasses the standard capacity queue and typically completes in minutes.
+   A community-confirmed technique as of early 2026; not officially documented by Oracle.
 
-This is enabled by default in `admin/profiles/laboratory.json`
-(`"try_a2_conversion": true`). The launcher tries it first on every run, then falls
-back to the standard lottery if it fails.
+2. **Standard retry lottery** — if A2 conversion isn't available or fails, the
+   orchestrator retries the direct A1.Flex launch indefinitely. Most accounts win
+   capacity within 24–72 hours; some wait longer.
 
-**Account requirements and cost:** `VM.Standard.A2.Flex` is not an Always Free shape.
-Creating it briefly accrues charges (billed per second). This is appropriate if:
+Both paths are automatic. You don't choose between them — the launcher tries A2→A1
+first and falls back silently.
 
-- You are within your **30-day free trial window** — the brief A2 cost draws from trial
-  credits and amounts to a fraction of a cent.
-- You have a **Pay-As-You-Go account** — same fraction-of-a-cent charge.
+**Cost:** `VM.Standard.A2.Flex` is not an Always Free shape; it accrues charges billed
+per second. The brief A2 existence costs a fraction of a cent and is terminated
+immediately on any failure. If your account is **pure Always Free** (trial expired, no
+PAYG), the A2 launch is rejected by Oracle with a `LimitExceeded` error and the
+standard lottery takes over — no charge, no action needed, the log explains what
+happened. To disable A2 conversion entirely, set `"try_a2_conversion": false` in
+`admin/profiles/laboratory.json`.
 
-If your account is **pure Always Free** (trial expired, no PAYG), the A2 launch will
-be rejected with a `LimitExceeded` error and the launcher falls through harmlessly to
-the standard lottery. No charge, no action needed. The log will tell you explicitly
-if this happens.
+**A2.Flex does not count against your 2-micro limit.** It is a separate shape family.
+Your existing management and worker VMs are unaffected.
 
-**A2.Flex does not count against your 2-micro limit.** It is a separate shape family
-with its own quota. Your existing management and worker VMs are unaffected.
-
-**After a successful conversion**, the laboratory instance is bare Ubuntu — the
-shape-change reboot interrupts cloud-init. Bootstrap the VM immediately:
+**After a successful A2→A1 conversion**, the laboratory VM is bare Ubuntu — the
+shape-change reboot interrupts cloud-init before it completes. Bootstrap it via the
+admin console **Tools** page: select the `laboratory` VM and run:
 ```bash
-bash admin/ssh-vm.sh laboratory   # then run your setup script
+git clone https://github.com/YOUR_USERNAME/YOUR_FORK.git ~/cloud-lab
+bash ~/cloud-lab/fleet/laboratory/setup.sh
 ```
-
-To disable the A2 conversion attempt entirely (standard lottery only), set
-`"try_a2_conversion": false` in `admin/profiles/laboratory.json`.
+Or SSH directly: `bash admin/ssh-vm.sh laboratory`
 
 **The 2-micro limit.**  Always Free includes exactly 2 `VM.Standard.E2.1.Micro`
 instances total. `management` and `worker` each use one. If you terminate both and

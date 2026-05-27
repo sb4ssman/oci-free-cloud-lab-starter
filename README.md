@@ -229,6 +229,13 @@ bash ~/cloud-lab/fleet/laboratory/setup.sh
 ```
 Or SSH directly: `bash admin/ssh-vm.sh laboratory`
 
+**Multi-AD rotation.**  In regions with multiple availability domains (e.g., us-ashburn-1
+has 3 ADs), the launcher automatically discovers all ADs and rotates round-robin on each
+attempt. This roughly triples your chances of winning capacity on any given cycle.
+If you leave `OCI_AVAILABILITY_DOMAIN` blank in `.env`, rotation is automatic.
+Set it to a specific AD name to lock to one domain. Single-AD regions (e.g., us-sanjose-1)
+work unchanged — rotation just uses the one domain on every attempt.
+
 **The 2-micro limit.**  Always Free includes exactly 2 `VM.Standard.E2.1.Micro`
 instances total. `management` and `worker` each use one. If you terminate both and
 try to relaunch simultaneously, Oracle may reject the second. Launch sequentially or
@@ -273,6 +280,63 @@ those into your project's `.env`. The fleet keeps managing itself independently.
 
 ---
 
+## SSH key persistence across relaunches
+
+By default each VM generates a fresh `fleet.key` on first boot. When management is
+relaunched (e.g., after Oracle reclaims it), the new key breaks SSH trust with worker
+and lab — they still have the old key in `authorized_keys`. Three options, used in order:
+
+**Option 1 — OCI Vault (recommended).**  Store one fixed fleet private key in an OCI
+Vault secret. Every VM retrieves the same key at boot via instance-principal auth, so
+the mesh survives any number of relaunches. One-time setup:
+
+```bash
+# 1. Create a Vault + Master Encryption Key in the OCI console, then:
+
+# 2. Store the fleet private key as a secret
+oci vault secret create-base64 \
+    --vault-id <vault-ocid> --key-id <mek-ocid> \
+    --compartment-id <compartment-ocid> \
+    --secret-name fleet-private-key \
+    --secret-content-content "$(base64 -w 0 < ~/.ssh/fleet.key)"
+
+# 3. Create a dynamic group covering all instances in your compartment
+oci iam dynamic-group create \
+    --name fleet-vms --compartment-id <tenancy-ocid> \
+    --matching-rule "ALL {instance.compartment.id = '<compartment-ocid>'}"
+
+# 4. Grant that group vault-read access
+oci iam policy create \
+    --name fleet-vault-read --compartment-id <compartment-ocid> \
+    --statements '["Allow dynamic-group fleet-vms to read secret-family in compartment id <compartment-ocid>"]'
+
+# 5. Paste the secret OCID into .env:
+#    FLEET_OCI_VAULT_SECRET_OCID=ocid1.vaultsecret.oc1...
+```
+
+**Option 2 — Base64 env var (fallback).**  Set `FLEET_PRIVATE_KEY_B64` in `.env`:
+```bash
+# Linux/macOS:
+base64 -w 0 < ~/.ssh/fleet.key
+
+# PowerShell:
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("$HOME\.ssh\fleet.key")) -replace "`r|`n",""
+```
+The key is embedded in the cloud-init user-data at launch time. Simpler than Vault
+but the key appears in OCI's launch metadata. Rotate it if a VM is compromised.
+
+**Option 3 — Admin recovery key (strongly recommended alongside either option above).**
+Set `ADMIN_SSH_PUBLIC_KEY` in `.env` to your personal public key:
+```bash
+cat ~/.ssh/id_ed25519.pub
+# Paste the output into ADMIN_SSH_PUBLIC_KEY in .env
+```
+This key is added to `authorized_keys` on every VM at boot — independent of the fleet
+key. Even after a management relaunch that scrambles the fleet key, you can SSH directly
+into any VM with your own key to repair the situation.
+
+---
+
 ## Security model
 
 - `.env` is gitignored — never committed to your fork
@@ -287,6 +351,9 @@ those into your project's `.env`. The fleet keeps managing itself independently.
 - `FLEET_HEARTBEAT_TOKEN` protects VM-to-management heartbeat writes
 - The Tools page and queue intentionally execute shell commands after authentication
 - `GITHUB_TOKEN` is optional for public forks; private forks should use a fine-grained read-only token
+- `FLEET_PRIVATE_KEY_B64` embeds the private key in cloud-init user-data — only use it
+  if OCI Vault isn't set up; rotate immediately if any VM is compromised
+- `FLEET_OCI_VAULT_SECRET_OCID` + instance-principal is the recommended secret delivery path
 
 ---
 

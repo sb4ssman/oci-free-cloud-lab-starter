@@ -10,6 +10,7 @@ the dependency story simple: Python standard library + the already-installed
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import os
 import platform
@@ -214,7 +215,13 @@ def run_oci_json(
         raise RetryError(f"OCI returned non-JSON output: {exc}\nstdout: {stdout}\nstderr: {stderr}") from exc
 
 
-def availability_domain(config: dict[str, Any]) -> str:
+def list_availability_domains(config: dict[str, Any]) -> list[str]:
+    """Return the list of ADs to cycle through.
+
+    If OCI_AVAILABILITY_DOMAIN (or the profile's availability_domain) is set to a valid AD,
+    only that AD is returned (no rotation).  When it is blank or "auto", all ADs discovered
+    from OCI are returned so the caller can rotate round-robin across them.
+    """
     configured = str(config.get("availability_domain", "")).strip()
     data = run_oci_json(
         ["iam", "availability-domain", "list", "--compartment-id", config["compartment_id"]],
@@ -226,16 +233,24 @@ def availability_domain(config: dict[str, Any]) -> str:
     names = [item["name"] for item in data.get("data", [])]
     if not names:
         raise RetryError("OCI returned no availability domains.")
-    if not configured:
-        log(f"Auto-selected AD: {names[0]}")
-        return names[0]
+    if not configured or configured.lower() == "auto":
+        if len(names) > 1:
+            log(f"Multi-AD rotation enabled across {len(names)} ADs: {', '.join(names)}")
+        else:
+            log(f"Auto-selected AD: {names[0]}")
+        return names
     if configured in names:
         log(f"AD verified by OCI: {configured}")
-        return configured
+        return [configured]
     if len(names) == 1:
         log(f"Configured AD '{configured}' is invalid. Using OCI-discovered AD: {names[0]}")
-        return names[0]
+        return names
     raise RetryError(f"Configured AD '{configured}' is not in OCI's list: {', '.join(names)}")
+
+
+def availability_domain(config: dict[str, Any]) -> str:
+    """Return a single AD to use (first in the list). Used by A2→A1 conversion path."""
+    return list_availability_domains(config)[0]
 
 
 def oci_connectivity_probe(config: dict[str, Any]) -> None:
@@ -325,7 +340,10 @@ def build_user_data(config: dict[str, Any], env: dict[str, str]) -> str | None:
     env = dict(env)
     if env.get("ADMIN_PASSWORD") and not env.get("ADMIN_PASSWORD_HASH"):
         env["ADMIN_PASSWORD_HASH"] = _hash_password(env["ADMIN_PASSWORD"])
-    for optional_key in ("GITHUB_TOKEN", "QUEUE_API_KEY", "FLEET_HEARTBEAT_TOKEN"):
+    for optional_key in (
+        "GITHUB_TOKEN", "QUEUE_API_KEY", "FLEET_HEARTBEAT_TOKEN",
+        "FLEET_OCI_VAULT_SECRET_OCID", "FLEET_PRIVATE_KEY_B64", "ADMIN_SSH_PUBLIC_KEY",
+    ):
         env.setdefault(optional_key, "")
 
     # Simple ${VAR} substitution from env. Unknown placeholders are left as-is.
@@ -866,7 +884,8 @@ def retry(config: dict[str, Any], env: dict[str, str]) -> int:
         console_url = f"https://cloud.oracle.com/compute/instances/{conversion_id}"
         return finish_success(config, env, conversion_id, console_url)
 
-    ad = availability_domain(config)
+    ads = list_availability_domains(config)
+    ad_cycle = itertools.cycle(ads)
     image_id = latest_image_id(config)
     log(f"Image ID    : {image_id}")
     log("Starting retry loop - press Ctrl+C to stop.")
@@ -885,8 +904,9 @@ def retry(config: dict[str, Any], env: dict[str, str]) -> int:
             return 0
 
         attempt += 1
+        ad = next(ad_cycle)
         temp_files: list[Path] = []
-        log(f"Attempt #{attempt} - sending OCI launch request for {config['instance_display_name']}...")
+        log(f"Attempt #{attempt} [{ad}] - sending OCI launch request for {config['instance_display_name']}...")
         try:
             args, temp_files = launch_args(config, image_id, ad, env)
             code, stdout, stderr, timed_out = run_oci(

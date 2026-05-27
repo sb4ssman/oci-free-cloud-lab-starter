@@ -36,6 +36,14 @@ sudo -u ubuntu git clone "$CLONE_URL" /home/ubuntu/cloud-lab \
   || sudo -u ubuntu git -C /home/ubuntu/cloud-lab pull --ff-only
 sudo -u ubuntu git -C /home/ubuntu/cloud-lab remote set-url origin "$CLEAN_URL" || true
 
+# Option 3: Add admin public key for human SSH recovery (always applied when set).
+if [ -n "${ADMIN_SSH_PUBLIC_KEY}" ]; then
+    echo "[cloud-init] Adding admin SSH recovery key to authorized_keys..."
+    echo "${ADMIN_SSH_PUBLIC_KEY}" >> /home/ubuntu/.ssh/authorized_keys
+    chmod 600 /home/ubuntu/.ssh/authorized_keys
+    chown ubuntu:ubuntu /home/ubuntu/.ssh/authorized_keys
+fi
+
 install -d -m 755 -o ubuntu -g ubuntu /home/ubuntu/.config/cloud-lab
 cat > /home/ubuntu/.config/cloud-lab/laboratory.env << 'ENVEOF'
 OCI_AUTH_MODE=instance_principal

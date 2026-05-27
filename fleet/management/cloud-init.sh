@@ -58,10 +58,52 @@ sudo -u ubuntu git clone "$CLONE_URL" /home/ubuntu/cloud-lab \
   || sudo -u ubuntu git -C /home/ubuntu/cloud-lab pull --ff-only
 sudo -u ubuntu git -C /home/ubuntu/cloud-lab remote set-url origin "$CLEAN_URL" || true
 
-echo "[cloud-init] Generating fleet SSH keypair..."
+echo "[cloud-init] Setting up fleet SSH keypair..."
+# Option 1: Retrieve private key from OCI Vault via instance principal (most secure).
+# Requires IAM dynamic group + vault-read policy; key never in env or git.
+if [ -n "${FLEET_OCI_VAULT_SECRET_OCID}" ]; then
+    echo "[cloud-init] Retrieving fleet key from OCI Vault (${FLEET_OCI_VAULT_SECRET_OCID})..."
+    if oci secrets secret-bundle get \
+            --secret-id "${FLEET_OCI_VAULT_SECRET_OCID}" \
+            --auth instance_principal \
+            --query 'data."secret-bundle-content".content' \
+            --raw-output 2>/dev/null \
+        | base64 -d > /home/ubuntu/.ssh/fleet.key.tmp \
+        && [ -s /home/ubuntu/.ssh/fleet.key.tmp ]; then
+        mv /home/ubuntu/.ssh/fleet.key.tmp /home/ubuntu/.ssh/fleet.key
+        chmod 600 /home/ubuntu/.ssh/fleet.key
+        chown ubuntu:ubuntu /home/ubuntu/.ssh/fleet.key
+        sudo -u ubuntu ssh-keygen -y -f /home/ubuntu/.ssh/fleet.key \
+             > /home/ubuntu/.ssh/fleet.key.pub
+        echo "[cloud-init] Fleet key loaded from Vault."
+    else
+        rm -f /home/ubuntu/.ssh/fleet.key.tmp
+        echo "[cloud-init] WARNING: Vault retrieval failed; falling through to next option."
+    fi
+fi
+# Option 2: Decode from base64 env var (fallback; rotate the key if it is ever compromised).
+# Generate: base64 -w 0 < ~/.ssh/your_fleet.key
+if [ ! -f /home/ubuntu/.ssh/fleet.key ] && [ -n "${FLEET_PRIVATE_KEY_B64}" ]; then
+    echo "[cloud-init] Decoding fleet key from FLEET_PRIVATE_KEY_B64..."
+    echo "${FLEET_PRIVATE_KEY_B64}" | base64 -d > /home/ubuntu/.ssh/fleet.key
+    chmod 600 /home/ubuntu/.ssh/fleet.key
+    chown ubuntu:ubuntu /home/ubuntu/.ssh/fleet.key
+    sudo -u ubuntu ssh-keygen -y -f /home/ubuntu/.ssh/fleet.key \
+         > /home/ubuntu/.ssh/fleet.key.pub
+    echo "[cloud-init] Fleet key decoded from env."
+fi
+# Fallback: generate fresh. Worker/lab lose SSH access when management relaunches without Vault or B64.
 if [ ! -f /home/ubuntu/.ssh/fleet.key ]; then
+    echo "[cloud-init] Generating fresh fleet SSH keypair (consider OCI Vault to avoid mesh disruption)..."
     sudo -u ubuntu ssh-keygen -t ed25519 \
         -f /home/ubuntu/.ssh/fleet.key -N "" -C "${FLEET_NAME}-fleet"
+fi
+# Option 3: Add admin public key for human SSH recovery (always applied when set).
+if [ -n "${ADMIN_SSH_PUBLIC_KEY}" ]; then
+    echo "[cloud-init] Adding admin SSH recovery key to authorized_keys..."
+    echo "${ADMIN_SSH_PUBLIC_KEY}" >> /home/ubuntu/.ssh/authorized_keys
+    chmod 600 /home/ubuntu/.ssh/authorized_keys
+    chown ubuntu:ubuntu /home/ubuntu/.ssh/authorized_keys
 fi
 
 echo "[cloud-init] Writing management.env..."
@@ -87,6 +129,8 @@ ADMIN_PASSWORD_HASH=${ADMIN_PASSWORD_HASH}
 OCI_SSH_PUBLIC_KEY_PATH=/home/ubuntu/.ssh/fleet.key.pub
 OCI_SSH_PRIVATE_KEY_PATH=/home/ubuntu/.ssh/fleet.key
 OCI_SSH_USER=ubuntu
+FLEET_OCI_VAULT_SECRET_OCID=${FLEET_OCI_VAULT_SECRET_OCID}
+ADMIN_SSH_PUBLIC_KEY=${ADMIN_SSH_PUBLIC_KEY}
 ENVEOF
 sed -i "s/__MANAGEMENT_PRIVATE_IP__/${MANAGEMENT_PRIVATE_IP}/g" /home/ubuntu/.config/cloud-lab/management.env
 chmod 600 /home/ubuntu/.config/cloud-lab/management.env

@@ -801,22 +801,24 @@ footer { text-align: center; font-size: 12px; color: var(--c-muted); padding: 20
 # localStorage keys use a generic 'fleet-' prefix.
 THEME_JS = """
 (function() {
-  var saved = localStorage.getItem('fleet-theme');
-  var pref  = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
-  var t = saved || pref;
-  document.documentElement.setAttribute('data-theme', t);
+  var r = document.documentElement;
+  var pal = localStorage.getItem('fleet-palette');
+  if (pal) {
+    try {
+      var p = JSON.parse(pal);
+      if (p.vars) {
+        Object.keys(p.vars).forEach(function(k) { r.style.setProperty(k, p.vars[k]); });
+        if (p.theme) r.setAttribute('data-theme', p.theme);
+      }
+    } catch(e) { localStorage.removeItem('fleet-palette'); }
+  } else {
+    var saved = localStorage.getItem('fleet-theme');
+    var pref  = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    r.setAttribute('data-theme', saved || pref);
+  }
+  var t = r.getAttribute('data-theme');
   var icon = document.getElementById('theme-icon');
   if (icon) icon.textContent = t === 'dark' ? '☀' : '🌙';
-
-  var pal = localStorage.getItem('fleet-palette');
-  if (pal) { try {
-    var p = JSON.parse(pal);
-    var r = document.documentElement;
-    r.style.setProperty('--c-primary',    p.primary);
-    if (p.primaryLt) r.style.setProperty('--c-primary-lt', p.primaryLt);
-    if (p.primaryDk) r.style.setProperty('--c-primary-dk', p.primaryDk);
-    if (p.accent)    r.style.setProperty('--c-accent',     p.accent);
-  } catch(e) {} }
 
   var logo = localStorage.getItem('fleet-logo');
   if (logo) {
@@ -827,8 +829,12 @@ THEME_JS = """
 })();
 
 function toggleTheme() {
-  var t = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
-  document.documentElement.setAttribute('data-theme', t);
+  var r = document.documentElement;
+  r.style.cssText = '';
+  localStorage.removeItem('fleet-palette');
+  document.querySelectorAll('.palette-btn').forEach(function(b) { b.classList.remove('active'); });
+  var t = r.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  r.setAttribute('data-theme', t);
   localStorage.setItem('fleet-theme', t);
   var icon = document.getElementById('theme-icon');
   if (icon) icon.textContent = t === 'dark' ? '☀' : '🌙';
@@ -849,19 +855,19 @@ function toggleCustomPanel() {
 }
 
 function applyPalette(btn) {
-  var p  = btn.dataset.primary;
-  var pl = btn.dataset.primaryLt;
-  var pd = btn.dataset.primaryDk;
-  var a  = btn.dataset.accent;
-  var r  = document.documentElement;
-  r.style.setProperty('--c-primary',    p);
-  r.style.setProperty('--c-primary-lt', pl);
-  r.style.setProperty('--c-primary-dk', pd);
-  r.style.setProperty('--c-accent',     a);
-  localStorage.setItem('fleet-palette', JSON.stringify({primary:p,primaryLt:pl,primaryDk:pd,accent:a}));
+  var vars  = JSON.parse(btn.dataset.vars);
+  var theme = btn.dataset.theme || 'light';
+  var r = document.documentElement;
+  r.style.cssText = '';
+  Object.keys(vars).forEach(function(k) { r.style.setProperty(k, vars[k]); });
+  r.setAttribute('data-theme', theme);
+  localStorage.setItem('fleet-palette', JSON.stringify({vars: vars, theme: theme}));
+  localStorage.setItem('fleet-theme', theme);
   document.querySelectorAll('.palette-btn').forEach(function(b) {
     b.classList.toggle('active', b === btn);
   });
+  var icon = document.getElementById('theme-icon');
+  if (icon) icon.textContent = theme === 'dark' ? '☀' : '🌙';
 }
 
 function applyCustomPalette() {
@@ -870,12 +876,11 @@ function applyCustomPalette() {
   var pd = document.getElementById('cp-primary-dk').value;
   var a  = document.getElementById('cp-accent').value;
   var logo = (document.getElementById('cp-logo') || {value:''}).value.trim();
+  var vars = {'--c-primary':p,'--c-primary-lt':pl,'--c-primary-dk':pd,'--c-accent':a};
   var r = document.documentElement;
-  r.style.setProperty('--c-primary',    p);
-  r.style.setProperty('--c-primary-lt', pl);
-  r.style.setProperty('--c-primary-dk', pd);
-  r.style.setProperty('--c-accent',     a);
-  localStorage.setItem('fleet-palette', JSON.stringify({primary:p,primaryLt:pl,primaryDk:pd,accent:a}));
+  r.style.cssText = '';
+  Object.keys(vars).forEach(function(k) { r.style.setProperty(k, vars[k]); });
+  localStorage.setItem('fleet-palette', JSON.stringify({vars: vars, theme: null}));
   if (logo) {
     document.querySelectorAll('.topbar-logo,.login-logo').forEach(function(img) {
       img.src = logo; img.classList.add('visible');
@@ -906,14 +911,47 @@ function copyText(text, btn) {
 }
 """
 
-# Five named presets + the Custom slot rendered separately in _topbar().
-# Tuple: (primary, primary_lt, primary_dk, accent, label)
+# Six named presets + the Custom slot rendered separately in _topbar().
+# Tuple: (name, btn_bg, theme, vars)
+# vars sets ALL CSS custom properties — palette is a complete visual identity.
+# theme is 'light' or 'dark'; applyPalette forces data-theme to match.
 PALETTE_PRESETS = [
-    ("#374151", "#4b5563", "#1f2937", "#f59e0b", "Slate"),       # default neutral
-    ("#1a3d6e", "#2d6cb5", "#0f2547", "#38bdf8", "Ocean"),       # navy + sky blue
-    ("#285e39", "#3a7a50", "#1b3f28", "#c5a028", "Forest"),     # forest green + gold
-    ("#0d1117", "#1c2128", "#010409", "#39ff14", "Neons"),       # near-black + neon green
-    ("#6b4226", "#8a5530", "#4a2d1b", "#d4882a", "Earthy"),     # terracotta + warm amber
+    ("Slate", "#1f2937", "light", {
+        "--c-primary": "#374151", "--c-primary-lt": "#4b5563", "--c-primary-dk": "#1f2937",
+        "--c-accent": "#f59e0b",
+        "--c-bg": "#f4f6f8", "--c-card": "#ffffff", "--c-border": "#d1d5db",
+        "--c-text": "#111827", "--c-muted": "#6b7280",
+    }),
+    ("Ocean", "#0f2547", "light", {
+        "--c-primary": "#1a3d6e", "--c-primary-lt": "#2d6cb5", "--c-primary-dk": "#0f2547",
+        "--c-accent": "#38bdf8",
+        "--c-bg": "#f0f4f9", "--c-card": "#ffffff", "--c-border": "#c8d8ec",
+        "--c-text": "#0f2030", "--c-muted": "#64748b",
+    }),
+    ("Forest", "#1b3f28", "light", {
+        "--c-primary": "#285e39", "--c-primary-lt": "#3a7a50", "--c-primary-dk": "#1b3f28",
+        "--c-accent": "#c5a028",
+        "--c-bg": "#eef6f0", "--c-card": "#ffffff", "--c-border": "#c4deca",
+        "--c-text": "#17202a", "--c-muted": "#64748b",
+    }),
+    ("Neon", "#010409", "dark", {
+        "--c-primary": "#39ff14", "--c-primary-lt": "#7fff00", "--c-primary-dk": "#2bcc10",
+        "--c-accent": "#ff00ff",
+        "--c-bg": "#0d1117", "--c-card": "#1c2128", "--c-border": "#30363d",
+        "--c-text": "#e6edf3", "--c-muted": "#8b949e",
+    }),
+    ("Earthy", "#4a2d1b", "light", {
+        "--c-primary": "#6b4226", "--c-primary-lt": "#8a5530", "--c-primary-dk": "#4a2d1b",
+        "--c-accent": "#d4882a",
+        "--c-bg": "#fdf6ef", "--c-card": "#ffffff", "--c-border": "#e8d5c4",
+        "--c-text": "#2c1810", "--c-muted": "#8b6e5a",
+    }),
+    ("Midnight", "#071d3e", "dark", {
+        "--c-primary": "#1a4f8c", "--c-primary-lt": "#2563b0", "--c-primary-dk": "#0f3460",
+        "--c-accent": "#e94560",
+        "--c-bg": "#0a0f1c", "--c-card": "#0f1729", "--c-border": "#1e2d45",
+        "--c-text": "#e2e8f0", "--c-muted": "#94a3b8",
+    }),
 ]
 
 _LOG_SERVICES = [
@@ -1006,11 +1044,11 @@ def _topbar(active: str = "") -> str:
     )
     preset_btns = " ".join(
         f'<button class="palette-btn"'
-        f' style="background:{p};--btn-accent:{a}"'
-        f' data-primary="{p}" data-primary-lt="{pl}"'
-        f' data-primary-dk="{pd}" data-accent="{a}"'
+        f' style="background:{btn_bg}"'
+        f' data-vars=\'{json.dumps(pvars)}\''
+        f' data-theme="{theme}"'
         f' onclick="applyPalette(this)">{name}</button>'
-        for p, pl, pd, a, name in PALETTE_PRESETS
+        for name, btn_bg, theme, pvars in PALETTE_PRESETS
     )
     # Custom button: diagonal split of two grays to suggest "make your own"
     custom_btn = (
@@ -1240,7 +1278,7 @@ def login_page(error: bool = False, locked: bool = False) -> bytes:
         + f'<div class="login-wrap"><div class="login-box">'
         + f'<img id="login-logo" class="login-logo" alt="Fleet Logo">'
         + f'<h1>{html.escape(FLEET_NAME)}</h1>'
-        + '<p class="sub">Private admin console</p>'
+        + '<p class="sub">Admin Dashboard</p>'
         + f'{err}'
         + '<form method="POST" action="/login">'
         + '<label for="u">Username</label>'

@@ -425,11 +425,25 @@ def _mgmt_tls_html() -> str:
     """Return HTML rows for TLS cert expiry and DuckDNS status (management card only)."""
     import subprocess as _sp, datetime as _dt
     rows = []
-    cert_root = Path.home() / ".local" / "share" / "caddy" / "certificates"
     cert_file: Path | None = None
-    if cert_root.exists():
-        for crt in sorted(cert_root.rglob("*.crt"), key=lambda p: p.stat().st_mtime, reverse=True):
-            cert_file = crt; break
+    for cert_root in [
+        Path.home() / ".local" / "share" / "caddy" / "certificates",
+        Path("/var/lib/caddy/.local/share/caddy/certificates"),
+        Path("/etc/caddy/certificates"),
+    ]:
+        try:
+            root_exists = cert_root.exists()
+        except PermissionError:
+            root_exists = False
+        if root_exists:
+            try:
+                for crt in sorted(cert_root.rglob("*.crt"), key=lambda p: p.stat().st_mtime, reverse=True):
+                    cert_file = crt
+                    break
+            except PermissionError:
+                pass
+        if cert_file:
+            break
     if cert_file:
         try:
             out  = _sp.check_output(["openssl", "x509", "-enddate", "-noout", "-in", str(cert_file)],

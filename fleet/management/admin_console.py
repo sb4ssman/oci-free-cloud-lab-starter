@@ -1045,6 +1045,14 @@ def _head(title: str, auto_refresh: int = 0) -> str:
     )
 
 
+_PAGE_SUBTITLES: dict[str, str] = {
+    "fleet":  "Fleet Management",
+    "stats":  "VM Stats",
+    "logs":   "Log Stream",
+    "export": "Export",
+}
+
+
 def _topbar(active: str = "") -> str:
     nav_items = [
         ("Fleet",  "/",       "fleet"),
@@ -1092,7 +1100,7 @@ def _topbar(active: str = "") -> str:
         f'<div class="topbar-left">'
         f'<a href="/" style="display:flex;align-items:center;gap:10px;text-decoration:none">'
         f'<img id="topbar-logo" class="topbar-logo" alt="Fleet Logo">'
-        f'<span class="fleet-name">{html.escape(FLEET_NAME)}</span>'
+        f'<span class="fleet-name">{html.escape(_PAGE_SUBTITLES.get(active, FLEET_NAME))}</span>'
         f'</a>'
         f'</div>'
         f'<nav class="topbar-nav">{links}'

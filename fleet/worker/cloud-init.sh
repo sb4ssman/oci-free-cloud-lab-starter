@@ -107,5 +107,7 @@ sudo -u ubuntu \
     env TOOLS_DIR=/home/ubuntu/cloud-lab \
     bash /home/ubuntu/cloud-lab/fleet/worker/setup.sh
 
+loginctl enable-linger ubuntu
+
 sudo -H -u ubuntu bash /home/ubuntu/cloud-lab/payload/keepalive/install.sh \
     /home/ubuntu/.config/cloud-lab/worker.env

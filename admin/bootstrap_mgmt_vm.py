@@ -187,6 +187,9 @@ force_key ADMIN_PASSWORD_HASH          {q(pw_hash)}
 echo "[bootstrap] Running role setup..."
 TOOLS_DIR="$HOME/cloud-lab" bash "$HOME/cloud-lab/fleet/management/setup.sh"
 
+echo "[bootstrap] Enabling user session linger (services survive reboot)..."
+sudo loginctl enable-linger "$USER"
+
 echo "[bootstrap] Opening ports 80/443 and internal 8765 in iptables..."
 sudo apt-get install -y -qq iptables-persistent
 if ! sudo iptables -C INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null; then

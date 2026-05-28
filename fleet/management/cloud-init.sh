@@ -141,6 +141,9 @@ sudo -H -u ubuntu \
     env TOOLS_DIR=/home/ubuntu/cloud-lab \
     bash /home/ubuntu/cloud-lab/fleet/management/setup.sh
 
+echo "[cloud-init] Enabling user session linger (services survive reboot)..."
+loginctl enable-linger ubuntu
+
 echo "[cloud-init] Configuring Caddy..."
 cat > /etc/caddy/Caddyfile << 'CADDYEOF'
 ${ADMIN_DOMAIN} {

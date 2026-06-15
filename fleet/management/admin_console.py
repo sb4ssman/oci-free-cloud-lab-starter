@@ -479,6 +479,13 @@ def _update_quota_cache() -> None:
     compartment_id = env.get("OCI_COMPARTMENT_ID", "")
     if not compartment_id:
         return
+    # Known Always Free maximums — used as fallback when OCI API is unreachable.
+    # A1 values updated June 2026 after Oracle halved the free-tier allocation.
+    _AF_MAX = {
+        "E2.Micro VMs": 2,
+        "A1 OCPUs":     2,
+        "A1 RAM (GB)":  12,
+    }
     limits = {}
     for limit_name, label in [
         ("standard-e2-micro-count",   "E2.Micro VMs"),
@@ -490,9 +497,10 @@ def _update_quota_cache() -> None:
                             "--compartment-id", compartment_id,
                             "--service-name", "compute",
                             "--limit-name", limit_name], timeout=30).get("data", {})
-            limits[label] = {"used": data.get("used","?"), "quota": data.get("effective-quota-value","?")}
+            quota = data.get("effective-quota-value") or _AF_MAX.get(label, "?")
+            limits[label] = {"used": data.get("used", "?"), "quota": quota}
         except Exception:
-            limits[label] = {"used": "?", "quota": "?"}
+            limits[label] = {"used": "?", "quota": _AF_MAX.get(label, "?")}
     _quota_cache    = limits
     _quota_cache_ts = now
 
@@ -660,7 +668,7 @@ a { color: var(--c-primary); }  a:hover { color: var(--c-primary-lt); }
 .topbar { background: var(--c-primary); color: #fff; padding: 0 20px;
           display: flex; align-items: center; justify-content: space-between;
           height: 52px; gap: 12px; }
-.topbar-left  { display: flex; align-items: center; gap: 10px; padding-left: 14px; }
+.topbar-left  { display: flex; align-items: center; gap: 10px; padding-left: 10px; }
 .topbar-logo  { height: 44px; width: auto; display: none;
                 filter: drop-shadow(0 1px 3px rgba(0,0,0,.4)) brightness(1.2); }
 .topbar-logo.visible { display: block; }

@@ -261,14 +261,14 @@ _IDEAS = [
     ),
     (
         "Jupyter Lab",
-        "Notebook server for Python, data science, and ML. The 4 OCPU handles parallel kernels.",
+        "Notebook server for Python, data science, and ML. The 2 OCPU handles parallel kernels.",
         ["python", "arm-native"],
         "https://jupyter.org",
         "pip install jupyterlab\njupyter lab --ip=127.0.0.1 --port=8888 --no-browser",
     ),
     (
         "llama.cpp",
-        "Run quantized LLMs locally. A 7B Q4 model fits easily in 24 GB. ARM NEON-optimized.",
+        "Run quantized LLMs locally. A 7B Q4 model fits in 12 GB. ARM NEON-optimized.",
         ["arm-native", "llm"],
         "https://github.com/ggerganov/llama.cpp",
         "git clone https://github.com/ggerganov/llama.cpp\ncd llama.cpp && make -j$(nproc)",

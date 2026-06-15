@@ -532,21 +532,74 @@ def _read_vm_crontab(vm_name: str) -> str:
     return _ssh_run(vm_name, "crontab -l 2>&1 || echo '(no crontab)'", timeout=10)
 
 
-def _svc_chip(name: str, svc: str, label: str) -> str:
+def _svc_row(name: str, svc: str, label: str, note: str = "") -> str:
     vm_h  = html.escape(name)
     svc_h = html.escape(svc)
     lbl_h = html.escape(label)
+    note_h = f'<div class="svc-note">{html.escape(note)}</div>' if note else ""
+    if not svc:
+        return f'<tr><td>{lbl_h}{note_h}</td><td></td></tr>'
     return (
-        f'<div class="svc-chip-row">'
-        f'<a class="svc-chip" href="/logs?vm={vm_h}&service={svc_h}">{lbl_h}</a>'
+        f'<tr>'
+        f'<td><a class="svc-chip" href="/logs?vm={vm_h}&service={svc_h}">{lbl_h}</a>{note_h}</td>'
+        f'<td>'
         f'<button class="svc-ctl" title="restart" data-vm="{vm_h}" data-svc="{svc_h}"'
         f' onclick="svcCtl(this.dataset.vm,this.dataset.svc,&apos;restart&apos;)">&#x21BA;</button>'
         f'<button class="svc-ctl stop" title="stop" data-vm="{vm_h}" data-svc="{svc_h}"'
         f' onclick="svcCtl(this.dataset.vm,this.dataset.svc,&apos;stop&apos;)">&#x25A0;</button>'
         f'<button class="svc-ctl" title="start" data-vm="{vm_h}" data-svc="{svc_h}"'
         f' onclick="svcCtl(this.dataset.vm,this.dataset.svc,&apos;start&apos;)">&#x25BA;</button>'
+        f'</td>'
+        f'</tr>'
+    )
+
+
+def _plain_work_row(label: str, note: str = "", status: str = "") -> str:
+    status_h = f'<span class="mini-badge {html.escape(status.lower())}">{html.escape(status)}</span>' if status else ""
+    note_h = f'<div class="svc-note">{html.escape(note)}</div>' if note else ""
+    return f'<tr><td>{html.escape(label)}{note_h}</td><td>{status_h}</td></tr>'
+
+
+def _work_section(title: str, rows: str) -> str:
+    if not rows:
+        rows = '<tr><td colspan="2" class="empty-row">None right now.</td></tr>'
+    return (
+        f'<div class="svc-section">'
+        f'<div class="svc-label">{html.escape(title)}</div>'
+        f'<table class="svc-table"><tbody>{rows}</tbody></table>'
         f'</div>'
     )
+
+
+def _queue_sections(name: str) -> tuple[str, str, str]:
+    jobs = _read_vm_queue(name)
+    running = [j for j in jobs if j.get("status") == "running"]
+    pending = [j for j in jobs if j.get("status") == "pending"]
+    completed = [j for j in jobs if j.get("status") in ("done", "failed")]
+    pending.sort(key=lambda j: (j.get("priority", 5), j.get("queued_at", "")))
+    completed.sort(key=lambda j: j.get("completed_at") or "", reverse=True)
+
+    active_rows = "".join(
+        _plain_work_row(j.get("label", "Queued job"), j.get("started_at", ""), "running")
+        for j in running[:2]
+    )
+    queue_rows = "".join(
+        _plain_work_row(
+            j.get("label", "Queued job"),
+            f'priority {j.get("priority", 5)} · queued {(j.get("queued_at") or "")[:16]}',
+            "pending",
+        )
+        for j in pending[:3]
+    )
+    done_rows = "".join(
+        _plain_work_row(
+            j.get("label", "Queued job"),
+            f'exit {j.get("exit_code", "")} · {(j.get("completed_at") or "")[:16]}',
+            j.get("status", ""),
+        )
+        for j in completed[:2]
+    )
+    return active_rows, queue_rows, done_rows
 
 
 def _run_service_control(vm_name: str, service: str, action: str) -> tuple[int, str]:
@@ -607,7 +660,7 @@ a { color: var(--c-primary); }  a:hover { color: var(--c-primary-lt); }
 .topbar { background: var(--c-primary); color: #fff; padding: 0 20px;
           display: flex; align-items: center; justify-content: space-between;
           height: 52px; gap: 12px; }
-.topbar-left  { display: flex; align-items: center; gap: 10px; }
+.topbar-left  { display: flex; align-items: center; gap: 10px; padding-left: 14px; }
 .topbar-logo  { height: 44px; width: auto; display: none;
                 filter: drop-shadow(0 1px 3px rgba(0,0,0,.4)) brightness(1.2); }
 .topbar-logo.visible { display: block; }
@@ -746,26 +799,40 @@ footer { text-align: center; font-size: 12px; color: var(--c-muted); padding: 20
 @media (max-width: 640px) {
   .fleet-name { display: none; }
   .topbar { padding: 0 10px; height: 46px; }
+  .topbar-left { padding-left: 0; }
   .topbar-logo { height: 36px; }
   .topbar-nav a[href="/export"] { display: none; }
   .topbar-nav a, .topbar-nav button { padding: 5px 7px; font-size: 13px; }
 }
 
-/* service chips */
+/* workload sections on VM cards */
 .svc-section { margin-top: 12px; border-top: 1px solid var(--c-border); padding-top: 10px; }
 .svc-label   { font-size: 11px; font-weight: 600; color: var(--c-muted); text-transform: uppercase;
                letter-spacing: .5px; margin-bottom: 6px; }
+.svc-table   { width: 100%; border-collapse: collapse; font-size: 12px; }
+.svc-table td { padding: 4px 6px; border-top: 1px solid var(--c-border); vertical-align: middle; }
+.svc-table tr:first-child td { border-top: none; }
+.svc-table td:last-child { text-align: right; white-space: nowrap; }
 .svc-chips   { display: flex; gap: 6px; flex-wrap: wrap; }
 .svc-chip    { font-size: 11px; padding: 3px 9px; border-radius: 999px; text-decoration: none;
                background: var(--c-bg); border: 1px solid var(--c-border); color: var(--c-text);
                transition: background .12s; }
 .svc-chip:hover { background: var(--c-accent); color: #1a1a1a; border-color: var(--c-accent); }
 .svc-chip-row  { display: flex; align-items: center; gap: 3px; }
+.svc-note { margin-top: 2px; color: var(--c-muted); font-size: 11px; line-height: 1.35; }
 .svc-ctl { font-size: 10px; padding: 1px 5px; border-radius: 4px; border: 1px solid var(--c-border);
            background: var(--c-bg); color: var(--c-muted); cursor: pointer; line-height: 1.5;
            transition: background .12s, color .12s; }
 .svc-ctl:hover { background: var(--c-primary); color: #fff; border-color: var(--c-primary); }
 .svc-ctl.stop:hover { background: #dc2626; border-color: #dc2626; }
+.mini-badge { display: inline-block; border-radius: 999px; padding: 1px 7px; font-size: 10px;
+              font-weight: 700; text-transform: uppercase; letter-spacing: .25px;
+              background: var(--c-border); color: var(--c-text); }
+.mini-badge.running, .mini-badge.active { background: #d97706; color: #fff; }
+.mini-badge.pending { background: #6b7280; color: #fff; }
+.mini-badge.done { background: #16a34a; color: #fff; }
+.mini-badge.failed { background: #dc2626; color: #fff; }
+.empty-row { color: var(--c-muted); font-size: 12px; padding: 2px 6px; }
 
 /* queue page */
 .q-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
@@ -977,22 +1044,43 @@ _LOG_SERVICES = [
     ("cloud-lab-update",       "Update"),
 ]
 
-_ROLE_SERVICES: dict[str, list[tuple[str, str]]] = {
-    "management": [
-        ("cloud-lab-orchestrator", "Orchestrator"),
-        ("cloud-lab-console",      "Console"),
-        ("cloud-lab-heartbeat",    "Heartbeat · 12h"),
-        ("cloud-lab-crosswatch",   "Crosswatch · 6h"),
-        ("cloud-lab-update",       "Auto-update · nightly"),
-    ],
-    "worker": [
-        ("cloud-lab-a1-lottery",   "A1 Lottery"),
-        ("cloud-lab-heartbeat",    "Heartbeat"),
-        ("cloud-lab-crosswatch",   "Crosswatch"),
-    ],
-    "laboratory": [
-        ("cloud-lab-heartbeat",    "Heartbeat"),
-    ],
+_ROLE_WORKLOADS: dict[str, dict[str, list[tuple[str, str, str]]]] = {
+    "management": {
+        "active": [
+            ("cloud-lab-orchestrator", "Orchestrator", "Reconciles the expected fleet state."),
+            ("cloud-lab-console",      "Console",      "Serves this admin dashboard."),
+        ],
+        "background": [
+            ("cloud-lab-heartbeat",  "Heartbeat",  "Owner-facing fleet summary every 12h."),
+            ("cloud-lab-crosswatch", "Crosswatch", "Peer VM health check every 6h."),
+        ],
+        "scheduled": [
+            ("cloud-lab-update", "Auto-update", "Nightly git pull maintenance."),
+        ],
+    },
+    "worker": {
+        "active": [
+            ("cloud-lab-a1-lottery", "A1 Lottery", "Retries A1 Flex capacity until laboratory is won."),
+        ],
+        "background": [
+            ("cloud-lab-heartbeat",  "Heartbeat",  "Reports worker health to management every 4h."),
+            ("cloud-lab-crosswatch", "Crosswatch", "Watches peers and can relaunch when needed."),
+        ],
+        "scheduled": [
+            ("cloud-lab-update", "Auto-update", "Nightly git pull maintenance."),
+        ],
+    },
+    "laboratory": {
+        "active": [
+            ("", "Ready for workload", "Install a payload or enqueue work for this VM."),
+        ],
+        "background": [
+            ("cloud-lab-heartbeat", "Heartbeat", "Reports laboratory health to management every 4h."),
+        ],
+        "scheduled": [
+            ("cloud-lab-update", "Auto-update", "Nightly git pull maintenance."),
+        ],
+    },
 }
 
 _PAYLOAD_PRESETS: list[tuple[str, str, str, str]] = [
@@ -1183,20 +1271,27 @@ def vm_cards() -> str:
                 '<a class="act-btn accent" href="/logs?vm=worker&service=cloud-lab-a1-lottery">Lottery logs</a>'
             )
 
-        svcs = _ROLE_SERVICES.get(role, [])
-        if svcs:
-            chip_links = "".join(
-                _svc_chip(name, svc_id, svc_lbl)
-                for svc_id, svc_lbl in svcs
-            )
-            svc_html = (
-                f'<div class="svc-section">'
-                f'<div class="svc-label">Background Services</div>'
-                f'<div class="svc-chips">{chip_links}</div>'
-                f'</div>'
-            )
-        else:
-            svc_html = ""
+        workloads = _ROLE_WORKLOADS.get(role, {})
+        queued_active, queue_rows, completed_rows = _queue_sections(name)
+        active_rows = queued_active + "".join(
+            _svc_row(name, svc_id, svc_lbl, svc_note)
+            for svc_id, svc_lbl, svc_note in workloads.get("active", [])
+        )
+        background_rows = "".join(
+            _svc_row(name, svc_id, svc_lbl, svc_note)
+            for svc_id, svc_lbl, svc_note in workloads.get("background", [])
+        )
+        scheduled_rows = "".join(
+            _svc_row(name, svc_id, svc_lbl, svc_note)
+            for svc_id, svc_lbl, svc_note in workloads.get("scheduled", [])
+        )
+        svc_html = (
+            _work_section("Active work", active_rows)
+            + _work_section("Queue", queue_rows)
+            + _work_section("Scheduled tasks", scheduled_rows)
+            + _work_section("Background services", background_rows)
+            + _work_section("Completed", completed_rows)
+        )
 
         cards.append(
             f'<div class="card">'

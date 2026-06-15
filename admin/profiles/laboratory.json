@@ -1,8 +1,8 @@
 {
   "instance_display_name": "laboratory",
   "shape": "VM.Standard.A1.Flex",
-  "ocpus": 4,
-  "memory_in_gbs": 24,
+  "ocpus": 2,
+  "memory_in_gbs": 12,
   "operating_system": "Canonical Ubuntu",
   "operating_system_version": "24.04",
   "try_a2_conversion": true,

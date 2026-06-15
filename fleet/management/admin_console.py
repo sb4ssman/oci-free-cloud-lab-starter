@@ -813,12 +813,10 @@ footer { text-align: center; font-size: 12px; color: var(--c-muted); padding: 20
 .svc-table td { padding: 4px 6px; border-top: 1px solid var(--c-border); vertical-align: middle; }
 .svc-table tr:first-child td { border-top: none; }
 .svc-table td:last-child { text-align: right; white-space: nowrap; }
-.svc-chips   { display: flex; gap: 6px; flex-wrap: wrap; }
 .svc-chip    { font-size: 11px; padding: 3px 9px; border-radius: 999px; text-decoration: none;
                background: var(--c-bg); border: 1px solid var(--c-border); color: var(--c-text);
                transition: background .12s; }
 .svc-chip:hover { background: var(--c-accent); color: #1a1a1a; border-color: var(--c-accent); }
-.svc-chip-row  { display: flex; align-items: center; gap: 3px; }
 .svc-note { margin-top: 2px; color: var(--c-muted); font-size: 11px; line-height: 1.35; }
 .svc-ctl { font-size: 10px; padding: 1px 5px; border-radius: 4px; border: 1px solid var(--c-border);
            background: var(--c-bg); color: var(--c-muted); cursor: pointer; line-height: 1.5;

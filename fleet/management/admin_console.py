@@ -67,6 +67,19 @@ _quota_cache: dict = {}
 _quota_cache_ts: float = 0.0
 _QUOTA_TTL: float = 3600.0  # quota refreshes every hour
 
+# Minimal server-rack SVG used as placeholder when no custom logo is configured.
+_DEFAULT_LOGO = (
+    "data:image/svg+xml;charset=utf-8,"
+    "%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 36 36' fill='none'"
+    " stroke='rgba(255,255,255,.85)' stroke-width='2'"
+    " stroke-linecap='round' stroke-linejoin='round'%3E"
+    "%3Crect x='3' y='5' width='30' height='9' rx='2'/%3E"
+    "%3Crect x='3' y='18' width='30' height='9' rx='2'/%3E"
+    "%3Ccircle cx='29' cy='9.5' r='1.5' fill='%234ade80' stroke='none'/%3E"
+    "%3Ccircle cx='29' cy='22.5' r='1.5' fill='%23f59e0b' stroke='none'/%3E"
+    "%3C/svg%3E"
+)
+
 _login_fails: dict[str, tuple[int, float]] = {}
 _fails_lock  = threading.Lock()
 MAX_LOGIN_ATTEMPTS = 5
@@ -1193,7 +1206,7 @@ def _topbar(active: str = "") -> str:
         f'<div class="topbar">'
         f'<div class="topbar-left">'
         f'<a href="/" style="display:flex;align-items:center;gap:10px;text-decoration:none">'
-        f'<img id="topbar-logo" class="topbar-logo" alt="Fleet Logo">'
+        f'<img id="topbar-logo" class="topbar-logo visible" src="{_DEFAULT_LOGO}" alt="Fleet Logo">'
         f'<span class="fleet-name">{html.escape(_PAGE_SUBTITLES.get(active, FLEET_NAME))}</span>'
         f'</a>'
         f'</div>'
@@ -1556,7 +1569,13 @@ def tools_page(preselect_vm: str = "") -> bytes:
         + '<button class="btn" id="run-btn" onclick="runPayload()">&#9654; Run on VM</button>'
         + '<span id="payload-status" style="font-size:13px;color:var(--c-muted)"></span>'
         + '</div>'
-        + '<pre id="payload-output" style="margin-top:16px;display:none"></pre>'
+        + '<div id="payload-header" style="display:none;justify-content:space-between;align-items:center;margin-top:16px;margin-bottom:4px">'
+        + '<span style="font-size:11px;font-weight:700;color:var(--c-muted);text-transform:uppercase;letter-spacing:.5px">Output</span>'
+        + '<button id="copy-btn" onclick="copyOutput()" style="font-size:12px;padding:3px 10px;'
+        + 'border:1px solid var(--c-border);border-radius:4px;background:var(--c-bg);'
+        + 'color:var(--c-text);cursor:pointer">&#x2398; Copy</button>'
+        + '</div>'
+        + '<pre id="payload-output" style="margin-top:0;display:none"></pre>'
         + "<script>"
         + f"var SCRIPTS={scripts_js};"
         + "function selectPreset(slug){"
@@ -1584,11 +1603,18 @@ def tools_page(preselect_vm: str = "") -> bytes:
         + "  .then(function(d){"
         + "    btn.disabled=false;btn.textContent='▶ Run on VM';"
         + "    status.textContent=d.exit_code===0?'✓ Done on '+vm:'✗ Exit '+d.exit_code+' on '+vm;"
-        + "    out.textContent=d.output||'(no output)';out.style.display='block';})"
+        + "    out.textContent=d.output||'(no output)';out.style.display='block';"
+        + "    document.getElementById('payload-header').style.display='flex';})"
         + "  .catch(function(e){"
         + "    btn.disabled=false;btn.textContent='▶ Run on VM';"
         + "    status.textContent='Request failed: '+e.message;"
-        + "    out.textContent=String(e);out.style.display='block';});}"
+        + "    out.textContent=String(e);out.style.display='block';"
+        + "    document.getElementById('payload-header').style.display='flex';});}"
+        + "function copyOutput(){"
+        + "  navigator.clipboard.writeText(document.getElementById('payload-output').textContent)"
+        + "  .then(function(){"
+        + "    var b=document.getElementById('copy-btn');b.textContent='✓ Copied';"
+        + "    setTimeout(function(){b.textContent='⎘ Copy';},1500);});}"
         + "</script>"
         + '</div></body></html>'
     )

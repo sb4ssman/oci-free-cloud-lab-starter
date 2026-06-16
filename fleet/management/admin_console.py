@@ -1972,6 +1972,12 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass   # suppress per-request access log noise
 
+    def handle_error(self, request, client_address):
+        import sys
+        if issubclass(sys.exc_info()[0], (BrokenPipeError, ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)
+
 
 # ── startup ───────────────────────────────────────────────────────────────────
 

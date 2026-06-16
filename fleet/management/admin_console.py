@@ -523,18 +523,83 @@ def _update_quota_cache() -> None:
 
 
 def _quota_html() -> str:
-    if not _quota_cache:
-        return ('<span class="muted" style="font-size:13px">Quota unavailable '
-                '(OCI_COMPARTMENT_ID not set or OCI unreachable)</span>')
-    parts = []
-    for label, vals in _quota_cache.items():
-        parts.append(
-            f'<div class="quota-item"><span class="quota-label">{html.escape(label)}</span>'
-            f'<span class="quota-val">{html.escape(str(vals.get("used","?")))}'
-            f'<span style="font-size:13px;font-weight:400;color:var(--c-muted)"> / {html.escape(str(vals.get("quota","?")))}</span>'
-            f'</span></div>'
+    """Render per-VM quota breakdown derived from OCI snapshots (no ? for RUNNING VMs)."""
+    _AF_MAX = {"e2": 2, "a1_ocpu": 2, "a1_ram_gb": 12}
+    fleet   = load_json(TOOLS_DIR / "fleet.json") or {"vms": []}
+    vm_defs = fleet.get("vms", [])
+    if not vm_defs:
+        return '<span class="muted" style="font-size:13px">fleet.json missing or empty</span>'
+
+    e2_used = 0
+    a1_ocpu_used = 0.0
+    a1_ram_used  = 0.0
+    rows: list[str] = []
+
+    for vm_def in vm_defs:
+        name           = vm_def.get("name", "?")
+        expected_shape = vm_def.get("shape", "")
+
+        snap      = load_json(PROFILE_DIR / f"{name}.json") or {}
+        inst      = snap.get("instance", {})
+        state     = inst.get("lifecycle-state", "") if inst else ""
+        shape     = inst.get("shape", expected_shape) if inst else expected_shape
+        shape_cfg = inst.get("shape-config", {}) if inst else {}
+
+        is_active = state in ("RUNNING", "PROVISIONING", "STARTING")
+        is_e2     = "E2.1.Micro" in shape
+        is_a1     = "A1.Flex"    in shape
+
+        if is_e2:
+            ocpus_disp = "1 OCPU"
+            ram_disp   = "1 GB RAM"
+            if is_active:
+                e2_used += 1
+        elif is_a1:
+            if is_active:
+                ocpus = int(shape_cfg.get("ocpus") or 2)
+                ram   = int(shape_cfg.get("memory-in-gbs") or 12)
+                a1_ocpu_used += ocpus
+                a1_ram_used  += ram
+            else:
+                prof  = load_json(TOOLS_DIR / "admin" / "profiles" / f"{name}.json") or {}
+                ocpus = int(prof.get("ocpus", 2))
+                ram   = int(prof.get("memory_in_gbs", 12))
+            ocpus_disp = f"{ocpus} OCPU"
+            ram_disp   = f"{ram} GB RAM"
+        else:
+            ocpus_disp = "? OCPU"
+            ram_disp   = "? GB RAM"
+
+        if not state:
+            badge_cls, badge_txt = "badge-unknown", "NOT FOUND"
+        elif is_active:
+            badge_cls, badge_txt = "badge-running", state
+        else:
+            badge_cls, badge_txt = "badge-unknown", state
+
+        target_note = (
+            '<span class="quota-target"> (target)</span>'
+            if not is_active and is_a1 else ""
         )
-    return "".join(parts)
+
+        rows.append(
+            f'<div class="quota-vm-row">'
+            f'<span class="quota-vm-name">{html.escape(name)}</span>'
+            f'<span class="quota-vm-shape">{html.escape(shape or expected_shape)}</span>'
+            f'<span class="badge {badge_cls}" style="font-size:11px;padding:2px 7px">'
+            f'{html.escape(badge_txt)}</span>'
+            f'<span class="quota-vm-res">{ocpus_disp} &middot; {ram_disp}{target_note}</span>'
+            f'</div>'
+        )
+
+    rows.append(
+        f'<div class="quota-totals-row">'
+        f'<span>E2.Micro VMs: <b>{int(e2_used)}</b> / {_AF_MAX["e2"]}</span>'
+        f'<span>A1 OCPUs: <b>{int(a1_ocpu_used)}</b> / {_AF_MAX["a1_ocpu"]}</span>'
+        f'<span>A1 RAM: <b>{int(a1_ram_used)} GB</b> / {_AF_MAX["a1_ram_gb"]} GB</span>'
+        f'</div>'
+    )
+    return "\n".join(rows)
 
 
 def _read_vm_queue(vm_name: str) -> list[dict]:
@@ -880,12 +945,18 @@ footer { text-align: center; font-size: 12px; color: var(--c-muted); padding: 20
 .audit-det  { flex: 1; color: var(--c-muted); font-family: monospace; }
 
 /* quota display */
-.quota-grid { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 6px; }
-.quota-item { background: var(--c-card); border: 1px solid var(--c-border); border-radius: 8px;
-              padding: 8px 14px; font-size: 13px; }
-.quota-label { font-size: 11px; color: var(--c-muted); font-weight: 600; display: block;
-               text-transform: uppercase; letter-spacing: .4px; }
-.quota-val   { font-size: 18px; font-weight: 700; }
+.quota-section { background: var(--c-card); border: 1px solid var(--c-border);
+                 border-radius: 10px; padding: 10px 16px; margin-top: 6px; }
+.quota-vm-row  { display: flex; align-items: center; gap: 10px; padding: 6px 0;
+                 border-bottom: 1px solid var(--c-border); font-size: 13px; }
+.quota-vm-name  { font-weight: 700; min-width: 96px; }
+.quota-vm-shape { color: var(--c-muted); font-size: 11px; font-family: monospace;
+                  min-width: 168px; }
+.quota-vm-res   { margin-left: auto; font-size: 13px; }
+.quota-target   { color: var(--c-muted); font-size: 11px; }
+.quota-totals-row { display: flex; flex-wrap: wrap; gap: 18px; padding-top: 9px;
+                    margin-top: 2px; font-size: 13px; color: var(--c-muted); }
+.quota-totals-row b { color: var(--c-text); }
 
 /* tools page */
 .tools-grid   { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit,minmax(280px,1fr)); margin-top: 16px; }
@@ -1771,7 +1842,7 @@ class Handler(BaseHTTPRequestHandler):
                 + f'<div class="content">'
                 + f'<div class="grid">{cards}</div>'
                 + f'<p class="section-title">Oracle Free Tier Quota</p>'
-                + f'<div class="quota-grid">{_quota_html()}</div>'
+                + f'<div class="quota-section">{_quota_html()}</div>'
                 + f'<p class="section-title">Recent Fleet Events</p>'
                 + f'<div>{events}</div>'
                 + '<p style="margin:24px 0 0;font-size:13px;color:var(--c-muted);text-align:center">'

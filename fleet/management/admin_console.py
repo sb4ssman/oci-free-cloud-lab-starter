@@ -667,6 +667,18 @@ def _queue_sections(name: str) -> tuple[str, str, str]:
     return active_rows, queue_rows, done_rows
 
 
+_CONSOLE_SVC = "cloud-lab-console"
+_SELF_RESTART_RE = re.compile(
+    r'(sudo\s+)?systemctl\s+(restart|start)\s+cloud-lab-console'
+)
+
+def _defer_console_restart() -> None:
+    """Restart the console service after a short delay so the HTTP response can be flushed first."""
+    time.sleep(1.5)
+    subprocess.run(["sudo", "systemctl", "restart", _CONSOLE_SVC],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def _run_service_control(vm_name: str, service: str, action: str) -> tuple[int, str]:
     safe_svc = service if re.match(r"^cloud-lab-[a-z0-9_-]+$", service) else ""
     if not safe_svc: return 1, f"Disallowed service name: {service!r}"
@@ -674,6 +686,9 @@ def _run_service_control(vm_name: str, service: str, action: str) -> tuple[int, 
     if not safe_action: return 1, f"Disallowed action: {action!r}"
     cmd = f"sudo systemctl {safe_action} {safe_svc} 2>&1; sudo systemctl status {safe_svc} --no-pager 2>&1 | head -20"
     if vm_name == "management":
+        if safe_svc == _CONSOLE_SVC and safe_action in ("restart", "start"):
+            threading.Thread(target=_defer_console_restart, daemon=True).start()
+            return 0, f"[{_CONSOLE_SVC}] restarting — page will reload in a few seconds"
         try:
             result = subprocess.run(["bash", "-c", cmd],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15)
@@ -1528,14 +1543,25 @@ def run_payload_on_vm(vm_name: str, script: str) -> tuple[bool, str]:
     script = header + script
 
     if vm_name == "management":
+        self_restart = bool(_SELF_RESTART_RE.search(script))
+        run_script = (
+            _SELF_RESTART_RE.sub(
+                'echo "[cloud-lab-console will restart after this script completes]"',
+                script,
+            ) if self_restart else script
+        )
         try:
             result = subprocess.run(
                 ["bash", "-s"],
-                input=script,
+                input=run_script,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, timeout=30,
             )
-            return True, result.stdout or "(no output)"
+            output = result.stdout or "(no output)"
+            if self_restart:
+                output += "\n\n[Restarting cloud-lab-console — page will reload in a few seconds]"
+                threading.Thread(target=_defer_console_restart, daemon=True).start()
+            return True, output
         except Exception as exc:
             return False, str(exc)
     else:

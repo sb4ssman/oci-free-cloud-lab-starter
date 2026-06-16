@@ -1746,6 +1746,12 @@ class Handler(BaseHTTPRequestHandler):
             self._redirect("/login",
                            f'{COOKIE_NAME}=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Strict')
             return
+        if path == "/health":
+            body_out = json.dumps({"status": "ok", "ts": int(time.time())}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body_out)))
+            self.end_headers(); self.wfile.write(body_out); return
 
         if not _is_authed(self):
             self._redirect("/login"); return

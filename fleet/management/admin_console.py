@@ -29,7 +29,7 @@ import shutil
 import subprocess
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -372,9 +372,12 @@ def collect_remote_logs(vm_name: str, service: str, lines: int = 200) -> str:
 def fleet_events_html() -> str:
     with _hb_lock:
         hbs = dict(_heartbeats)
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
     all_events: list[dict] = []
     for vm_name, hb in hbs.items():
         for ev in hb.get("events", []):
+            if ev.get("received_at", "") < cutoff:
+                continue
             all_events.append({
                 "vm": vm_name,
                 "received_at": ev.get("received_at", ""),
@@ -512,7 +515,8 @@ def _update_quota_cache() -> None:
                             "--limit-name", limit_name], timeout=30).get("data", {})
             quota = data.get("effective-quota-value") or _AF_MAX.get(label, "?")
             limits[label] = {"used": data.get("used", "?"), "quota": quota}
-        except Exception:
+        except Exception as exc:
+            print(f"[quota] {label} ({limit_name}): {exc!s:.300}", flush=True)
             limits[label] = {"used": "?", "quota": _AF_MAX.get(label, "?")}
     _quota_cache    = limits
     _quota_cache_ts = now
@@ -1911,7 +1915,10 @@ class Handler(BaseHTTPRequestHandler):
                         existing.setdefault("events", []).append(
                             {"received_at": now, "event": str(ev)[:200]}
                         )
-                        existing["events"] = existing["events"][-50:]
+                    cutoff_iso = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+                    existing["events"] = [
+                        e for e in existing.get("events", []) if e.get("received_at", "") >= cutoff_iso
+                    ][-50:]
                     _heartbeats[vm] = existing
                 save_heartbeats()
             self._json(200, {"ok": True}); return

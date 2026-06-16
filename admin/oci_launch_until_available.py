@@ -888,9 +888,10 @@ def retry(config: dict[str, Any], env: dict[str, str]) -> int:
     ad_cycle = itertools.cycle(ads)
     image_id = latest_image_id(config)
     log(f"Image ID    : {image_id}")
-    log("Starting retry loop - press Ctrl+C to stop.")
+    log(f"Starting retry loop at {datetime.now():%Y-%m-%d %H:%M:%S} — press Ctrl+C to stop.")
 
     attempt = 0
+    loop_start = time.monotonic()
     while True:
         # Guard at top of every iteration: if a previous timed-out launch actually
         # succeeded, OCI will show the instance as PROVISIONING/RUNNING here.
@@ -906,7 +907,11 @@ def retry(config: dict[str, Any], env: dict[str, str]) -> int:
         attempt += 1
         ad = next(ad_cycle)
         temp_files: list[Path] = []
-        log(f"Attempt #{attempt} [{ad}] - sending OCI launch request for {config['instance_display_name']}...")
+        elapsed_s = int(time.monotonic() - loop_start)
+        _eh, _rem = divmod(elapsed_s, 3600)
+        _em, _es  = divmod(_rem, 60)
+        elapsed_str = f"{_eh}h{_em:02d}m" if _eh else f"{_em}m{_es:02d}s"
+        log(f"Attempt #{attempt} [{ad}] [session: {elapsed_str}] - sending OCI launch request for {config['instance_display_name']}...")
         try:
             args, temp_files = launch_args(config, image_id, ad, env)
             code, stdout, stderr, timed_out = run_oci(

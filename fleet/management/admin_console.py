@@ -654,9 +654,29 @@ def _queue_sections(name: str, row) -> tuple[str, str, str]:
 
 
 _CONSOLE_SVC = "cloud-lab-console"
+# Matches restarts that would take down this console mid-request: the literal
+# unit name OR a glob that covers it (e.g. systemctl restart 'cloud-lab-*').
+# Without the glob case, the update-repo preset kills the console before the
+# HTTP response is flushed and the browser sees an empty (invalid JSON) reply.
 _SELF_RESTART_RE = re.compile(
-    r'(sudo\s+)?systemctl\s+(restart|start)\s+cloud-lab-console'
+    r'(sudo\s+)?systemctl\s+(restart|start)\s+([\'"]?)cloud-lab-(console\b|\*)\3'
 )
+
+_DEFER_NOTE_CMD = 'echo "[cloud-lab-console will restart after this script completes]"'
+
+# For glob restarts, restart every OTHER cloud-lab unit inline and defer only
+# the console; a plain console restart is deferred outright.
+_RESTART_OTHERS_CMD = (
+    "sudo systemctl restart $(sudo systemctl list-units --plain --no-legend 'cloud-lab-*' "
+    "| awk '{print $1}' | grep -v cloud-lab-console) 2>/dev/null || true; "
+    + _DEFER_NOTE_CMD
+)
+
+
+def _sub_self_restart(match: "re.Match[str]") -> str:
+    if "*" in match.group(0):
+        return _RESTART_OTHERS_CMD
+    return _DEFER_NOTE_CMD
 
 def _defer_console_restart() -> None:
     """Restart the console service after a short delay so the HTTP response can be flushed first."""
@@ -1025,14 +1045,19 @@ label { font-size: 13px; color: var(--c-text);
               overflow-x: auto; white-space: pre-wrap; color: var(--c-text); }
 footer { text-align: center; font-size: 12px; color: var(--c-muted); padding: 20px 16px; }
 
-/* mobile */
+/* mobile — topbar wraps instead of overflowing (an overflowed gear button is
+   unreachable on touch), and tap targets get comfortable sizes */
+.topbar-nav a, .topbar-nav button { touch-action: manipulation; }
 @media (max-width: 640px) {
   .fleet-name { display: none; }
-  .topbar { padding: 0 10px; height: 46px; }
+  .topbar { padding: 4px 10px; height: auto; min-height: 46px; flex-wrap: wrap; }
   .topbar-left { padding-left: 0; }
   .topbar-logo { height: 36px; }
+  .topbar-nav { flex-wrap: wrap; }
   .topbar-nav a[href="/export"] { display: none; }
-  .topbar-nav a, .topbar-nav button { padding: 5px 7px; font-size: 13px; }
+  .topbar-nav a, .topbar-nav button { padding: 8px 9px; font-size: 13px; }
+  .theme-btn { min-width: 42px; min-height: 38px; }
+  .settings-panel { width: min(280px, 100vw); }
 }
 
 /* workload sections on VM cards */
@@ -1216,7 +1241,11 @@ async function svcCtl(vm, svc, action) {
       headers:{"Content-Type":"application/json"},
       body: JSON.stringify({vm: vm, service: svc, action: action})});
   } catch(e) { alert("Request failed: " + e); return; }
-  var d = await r.json();
+  var d;
+  try { d = await r.json(); }
+  catch(e) {
+    d = {output: "No response — if you restarted the console, reload in a few seconds."};
+  }
   alert((d.output || d.error || "Done").trim());
 }
 
@@ -1716,10 +1745,14 @@ def std_tools_page(preselect_vm: str = "") -> bytes:
         + "  fetch('/run-payload',{method:'POST',"
         + "    headers:{'Content-Type':'application/json'},"
         + "    body:JSON.stringify({vm:vm,script:script})})"
-        + "  .then(function(r){return r.json();})"
-        + "  .then(function(d){"
+        + "  .then(function(r){return r.text();})"
+        + "  .then(function(t){"
+        + "    var d;"
+        + "    try{d=JSON.parse(t);}"
+        + "    catch(e){d={ok:false,output:t||'(no response — if the script restarts the console, reload in a few seconds)'};}"
+        + "    var ok=(d.exit_code===undefined)?!!d.ok:d.exit_code===0;"
         + "    btn.disabled=false;btn.textContent='▶ Run on VM';"
-        + "    status.textContent=d.exit_code===0?'✓ Done on '+vm:'✗ Exit '+d.exit_code+' on '+vm;"
+        + "    status.textContent=ok?'✓ Done on '+vm:'✗ Failed on '+vm;"
         + "    out.textContent=d.output||'(no output)';out.style.display='block';"
         + "    document.getElementById('payload-header').style.display='flex';})"
         + "  .catch(function(e){"
@@ -1852,7 +1885,11 @@ async function svcCtl(vm, svc, action) {
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({vm: vm, service: svc, action: action})});
   } catch(e) { alert("Request failed: " + e); return; }
-  var d = await r.json();
+  var d;
+  try { d = await r.json(); }
+  catch(e) {
+    d = {output: "No response — if you restarted the console, reload in a few seconds."};
+  }
   alert((d.output || d.error || "Done").trim());
 }
 
@@ -2475,10 +2512,8 @@ def run_payload_on_vm(vm_name: str, script: str) -> tuple[bool, str]:
     if vm_name == "management":
         self_restart = bool(_SELF_RESTART_RE.search(script))
         run_script = (
-            _SELF_RESTART_RE.sub(
-                'echo "[cloud-lab-console will restart after this script completes]"',
-                script,
-            ) if self_restart else script
+            _SELF_RESTART_RE.sub(_sub_self_restart, script)
+            if self_restart else script
         )
         try:
             result = subprocess.run(
@@ -2552,10 +2587,17 @@ function runPayload() {
   fetch('/run-payload', {method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({vm: vm, script: script})})
-  .then(function(r) { return r.json(); })
-  .then(function(d) {
+  .then(function(r) { return r.text(); })
+  .then(function(t) {
+    var d;
+    try { d = JSON.parse(t); }
+    catch(e) {
+      d = {ok: false, output: t ||
+        '(no response — if the script restarts the console, reload in a few seconds)'};
+    }
+    var ok = (d.exit_code === undefined) ? !!d.ok : d.exit_code === 0;
     btn.disabled = false; btn.textContent = 'RUN ON VM';
-    status.textContent = d.ok ? 'DONE ON ' + vm.toUpperCase() : 'FAILED ON ' + vm.toUpperCase();
+    status.textContent = ok ? 'DONE ON ' + vm.toUpperCase() : 'FAILED ON ' + vm.toUpperCase();
     out.textContent = d.output || '(no output)'; out.style.display = 'block';
     document.getElementById('payload-header').style.display = 'flex';
   })

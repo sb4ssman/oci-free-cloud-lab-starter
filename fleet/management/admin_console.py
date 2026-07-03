@@ -1961,6 +1961,16 @@ _PAYLOAD_PRESETS: list[tuple[str, str, str, str]] = [
 
 _LC = "/static/lcars/thelcars"
 
+# LCARS color themes, cookie-selected. Each swaps the official TheLCARS.com
+# base stylesheet; console.css carries per-theme bridge vars for the console's
+# own components (keyed off data-lcars-palette on <html>).
+_LCARS_PALETTES = [
+    ("classic",     "Classic",      "lcars-classic.css"),
+    ("nemesis",     "Nemesis Blue", "nemesis-blue.css"),
+    ("lower-decks", "Lower Decks",  "lower-decks.css"),
+]
+_LCARS_SHEETS = {key: sheet for key, _label, sheet in _LCARS_PALETTES}
+
 _NAV_ITEMS = [
     ("01", "FLEET", "/",      "fleet"),
     ("02", "STATS", "/stats", "stats"),
@@ -1980,13 +1990,16 @@ def _lcars_head(title: str, auto_refresh: int = 0) -> str:
     refresh = f'<meta http-equiv="refresh" content="{auto_refresh}">' if auto_refresh else ""
     scale = getattr(_ui_ctx, "scale", 1.0)
     style = f' style="--ui-scale:{scale:g}"' if scale != 1.0 else ""
+    palette = getattr(_ui_ctx, "palette", "classic")
+    pal_attr = f' data-lcars-palette="{palette}"' if palette != "classic" else ""
+    sheet = _LCARS_SHEETS.get(palette, "lcars-classic.css")
     return (
-        f'<!doctype html><html lang="en"{style}><head>'
+        f'<!doctype html><html lang="en"{pal_attr}{style}><head>'
         '<meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">'
         f'{refresh}'
         f'<title>{html.escape(title)}</title>'
-        f'<link rel="stylesheet" href="{_LC}/lcars-classic.css?v={STATIC_ASSET_VERSION}">'
+        f'<link rel="stylesheet" href="{_LC}/{sheet}?v={STATIC_ASSET_VERSION}">'
         f'<link rel="stylesheet" href="/static/lcars/console.css?v={STATIC_ASSET_VERSION}">'
         '</head><body>'
     )
@@ -2086,7 +2099,10 @@ def _c_frame(active: str, banner: str, content: str, fleet_h: str, footer: str,
     refresh_label = f"Auto-refresh {auto_refresh}s" if auto_refresh else "LCARS 47.3"
     return (
         '<div class="wrap">'
-        '<div class="cframe-elbow cframe-elbow--top"></div>'
+        '<div class="cframe-elbow cframe-elbow--top">'
+        '<span class="elbow-code">Sector 47</span>'
+        '<span class="elbow-label">A1&#183;Flex</span>'
+        '</div>'
         '<div class="cframe-right cframe-right--top">'
         '<div class="cframe-bar">'
         f'<div class="bar-fill">{html.escape(banner)}&nbsp;&#149;&nbsp;<span id="Stardate"></span></div>'
@@ -2701,6 +2717,7 @@ _SETTINGS_JS = """
 function setCookie(k, v) { document.cookie = k + '=' + v + '; Path=/; SameSite=Strict; Max-Age=31536000'; }
 function setUiMode(m) { setCookie('fleet_ui_mode', m); window.location.href = '/'; }
 function setLcarsLayout(l) { setCookie('lcars_layout', l); location.reload(); }
+function setLcarsPalette(p) { setCookie('lcars_palette', p); location.reload(); }
 function uiScale(v) {
   document.documentElement.style.setProperty('--ui-scale', v / 100);
   setCookie('ui_scale', v);
@@ -2725,6 +2742,7 @@ markBeeps();
 
 def lcars_settings_page(layout: str, scale: float) -> bytes:
     pct = int(round(scale * 100))
+    palette = getattr(_ui_ctx, "palette", "classic")
     t_cur = ' class="current"' if layout != "c" else ""
     c_cur = ' class="current"' if layout == "c" else ""
     body = (
@@ -2742,6 +2760,15 @@ def lcars_settings_page(layout: str, scale: float) -> bytes:
         f'<button{c_cur} onclick="setLcarsLayout(\'c\')">Full frame C</button>'
         '</div>'
         '<p class="meta-line">The C layout closes the frame with a bottom bar.</p>'
+        + _lcars_text_bar("Color Theme")
+        + '<div class="btn-row">'
+        + "".join(
+            f'<button{" class=" + chr(34) + "current" + chr(34) if key == palette else ""}'
+            f' onclick="setLcarsPalette(\'{key}\')">{label}</button>'
+            for key, label, _sheet in _LCARS_PALETTES
+        )
+        + '</div>'
+        '<p class="meta-line">Variant palettes recolor the whole interface &middot; alerts stay red.</p>'
         + _lcars_text_bar("Interface Scale")
         + '<div class="run-bar">'
         f'<input id="scale-slider" type="range" min="70" max="140" step="5" value="{pct}"'
@@ -2792,6 +2819,8 @@ class Handler(BaseHTTPRequestHandler):
             scale = 1.0
         _ui_ctx.scale  = min(1.4, max(0.7, scale))
         _ui_ctx.layout = "c" if cookies.get("lcars_layout") == "c" else "t"
+        pal = cookies.get("lcars_palette", "classic")
+        _ui_ctx.palette = pal if pal in _LCARS_SHEETS else "classic"
         mode = cookies.get("fleet_ui_mode", DEFAULT_UI_MODE)
         return "lcars" if mode == "lcars" else "standard"
 

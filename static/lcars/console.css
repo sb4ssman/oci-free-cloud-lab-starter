@@ -46,8 +46,32 @@ input[type="range"] {
 }
 
 /* elbow must reach past the 60px inner corner cut so the curve closes cleanly */
-.cframe-elbow--top    { min-height: calc(var(--cbar-h) + 60px); border-radius: var(--radius-bottom); }
-.cframe-elbow--bottom { min-height: calc(var(--cbar-h) + 60px); border-radius: var(--radius-top); align-items: flex-start; }
+.cframe-elbow--top {
+	min-height: calc(var(--cbar-h) + 60px);
+	border-radius: var(--radius-bottom);
+	flex-direction: column;
+	justify-content: flex-end;
+	gap: .1rem;
+}
+
+.cframe-elbow--bottom {
+	min-height: calc(var(--cbar-h) + 60px);
+	border-radius: var(--radius-top);
+	align-items: flex-start;
+}
+
+.cframe-elbow .elbow-code {
+	font-size: .6rem;
+	font-weight: 600;
+	letter-spacing: .14em;
+	text-transform: uppercase;
+}
+
+.cframe-elbow .elbow-label {
+	font-size: 1.05rem;
+	font-weight: bold;
+	line-height: 1;
+}
 
 .cframe-right {
 	flex: 1;
@@ -148,6 +172,8 @@ input[type="range"] {
 	width: var(--lfw);
 	display: flex;
 	flex-direction: column;
+	/* black breaks between the rail and both elbows */
+	padding-block: var(--divider-height);
 }
 
 .cframe-rail button,
@@ -192,6 +218,102 @@ input[type="range"] {
 
 /* the C-frame's top bar already carries the page title */
 .cframe-main main > h1:first-child { display: none; }
+
+/* ── LCARS theme bridges ───────────────────────────────────────────────── */
+/* Non-classic themes load the official TheLCARS.com theme stylesheet as the
+   base (different var names: --evening, --tangerine, --october-sunset, …).
+   These blocks bridge the Classic var names used by the console's own
+   components onto each theme's palette. Alert reds stay red. */
+
+[data-lcars-palette="nemesis"] {
+	/* official Nemesis Blue: evening #26f · cool #69f · ghost #8bf ·
+	   moonbeam #ebf0ff · tangerine #f83 · honey #fc9 · wheat #ca8 ·
+	   grape #96c · cardinal #c23 · galaxy-gray #52526a */
+	--golden-orange: #f83;
+	--orange: #f74;
+	--gold: #fc9;
+	--sunglow: #ebf0ff;
+	--butterscotch: #ca8;
+	--almond: #8bf;
+	--almond-creme: #ebf0ff;
+	--peach: #c66;
+	--sunflower: #ebf0ff;
+	--african-violet: #69f;
+	--lilac: #96c;
+	--bluey: #26f;
+	--ice: #8bf;
+	--sky: #69f;
+	--gray: #52526a;
+	--lima-bean: #9c3;
+	--tomato: #c23;
+	--red: #c66;
+	--space-white: #ebf0ff;
+}
+
+[data-lcars-palette="lower-decks"] {
+	/* official Lower Decks: october-sunset #f40 · orange #f70 ·
+	   harvestgold #fa4 · honey #fc9 · daybreak #f91 · butter #fec */
+	--golden-orange: #fa4;
+	--orange: #f70;
+	--gold: #fc9;
+	--sunglow: #fec;
+	--butterscotch: #f91;
+	--almond: #fc9;
+	--almond-creme: #fec;
+	--peach: #f70;
+	--sunflower: #fec;
+	--african-violet: #f91;
+	--lilac: #fa4;
+	--bluey: #f70;
+	--ice: #fec;
+	--sky: #fc9;
+	--gray: #668;
+	--lima-bean: #cc6;
+	--tomato: #f55;
+	--red: #cf4f4f;
+	--space-white: #fff8ee;
+}
+
+/* Utility classes the console markup uses. The Classic sheet defines these
+   too, but the official V24 theme sheets name their colors differently —
+   declaring them here (over the bridged vars) makes them theme-proof. */
+
+.background-golden-orange { background-color: var(--golden-orange) !important; }
+.background-orange        { background-color: var(--orange) !important; }
+.background-gold          { background-color: var(--gold) !important; }
+.background-sunglow       { background-color: var(--sunglow) !important; }
+.background-bluey         { background-color: var(--bluey) !important; }
+.background-lilac         { background-color: var(--lilac) !important; }
+.background-ice           { background-color: var(--ice) !important; }
+.background-sky           { background-color: var(--sky) !important; }
+.background-almond        { background-color: var(--almond) !important; }
+.background-red           { background-color: var(--red) !important; }
+.background-tomato        { background-color: var(--tomato) !important; }
+.background-lima-bean     { background-color: var(--lima-bean) !important; }
+
+.button-golden-orange { background-color: var(--golden-orange) !important; }
+.button-bluey         { background-color: var(--bluey) !important; }
+.button-lilac         { background-color: var(--lilac) !important; }
+.button-sky           { background-color: var(--sky) !important; }
+.button-almond        { background-color: var(--almond) !important; }
+
+[data-lcars-palette="mda"] {
+	--golden-orange: #d9b64a;
+	--orange: #c5a028;
+	--gold: #e8cc70;
+	--sunglow: #f0dc94;
+	--butterscotch: #b0c780;
+	--almond: #b5d9a8;
+	--almond-creme: #d0e8c5;
+	--peach: #9fcf90;
+	--sunflower: #d6eec0;
+	--african-violet: #7fc98a;
+	--lilac: #9fd9b0;
+	--bluey: #79c9a8;
+	--ice: #a8e8c8;
+	--sky: #90dfc0;
+	--lima-bean: #cde06a;
+}
 
 /* ── nav state ─────────────────────────────────────────────────────────── */
 

@@ -16,7 +16,10 @@ Files:
 
 | File | Purpose |
 |---|---|
-| `lcars-classic.css` | The framework — chassis, panels, bars, buttons, colors |
+| `lcars-classic.css` | The framework — chassis, panels, bars, buttons, colors (Classic V26) |
+| `nemesis-blue.css` | Official Nemesis Blue theme (V24.2, from the template download) |
+| `lower-decks.css` | Official Lower Decks theme (V24.2, from the template download) |
+| `lower-decks-padd.css` | Official Lower Decks PADD variant (unused, kept for reference) |
 | `Antonio-*.woff2/.woff` | LCARS display typeface |
 | `lcars.js` | Template helpers (beep-and-navigate, scroll-top, accordion) |
 | `beep1-4.mp3` | Interface audio cues |

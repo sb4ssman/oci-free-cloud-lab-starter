@@ -139,14 +139,28 @@ admin\check-all-vms.bat
 
 Or just watch the admin console — it auto-refreshes every 60 seconds and shows live
 VM state, heartbeat times, uptime, and links to log streams for each background service.
-The console has a dark/light mode toggle, color palette presets, and a **Tools** page
-where you can pick preset scripts or write your own and run them on any fleet VM
-directly from the browser. It also includes:
+The console defaults to a standard dashboard with dark/light mode and color palette
+presets, and includes a **Tools** page where you can pick preset scripts or write your
+own and run them on any fleet VM directly from the browser. It also includes:
 
 - **Queue** (`/queue`) — view and manage the job queue across all VMs
 - **Audit log** (`/audit`) — full trail of tool runs, service control, and API-enqueued jobs
 - **Service control** — start/stop/restart individual services from the fleet page
 - **Agent API** — `POST /enqueue` with `Authorization: Bearer <QUEUE_API_KEY>` so an LLM agent can queue work without a browser session
+
+### LCARS mode
+
+The settings panel (gear icon) can switch the whole console into an **LCARS**
+interface mode built on the [TheLCARS.com](https://www.thelcars.com) website template
+(Classic Theme), vendored under `static/lcars/thelcars/` together with the free
+Antonio font. The template is free to use under its
+[EULA](https://www.thelcars.com/license/) (personal, non-commercial, with
+attribution — the console footer carries the credit). LCARS mode has its own
+settings page (`09-SETUP` panel): switch back to standard, choose a sideways-T or
+full-frame-C layout, scale the whole interface with a size slider, and mute the
+panel beeps. Set `CONSOLE_DEFAULT_UI=lcars` to make LCARS the default.
+STAR TREK and related marks are trademarks of CBS Studios Inc.; this project is not
+affiliated with CBS Studios Inc.
 
 ---
 

@@ -1,0 +1,528 @@
+@charset "utf-8";
+
+/*
+	console.css — fleet admin console supplements for TheLCARS.com Classic Theme.
+	Loads AFTER lcars-classic.css and only adds what the framework doesn't
+	provide: data tables, forms, VM cards, status blocks, log readouts.
+	All colors come from the framework's :root custom properties.
+*/
+
+/* ── interface scale ───────────────────────────────────────────────────── */
+/* --ui-scale is set inline on <html> from the /settings slider (cookie-backed).
+   The two base sizes mirror the framework's own breakpoints. */
+
+:root { font-size: calc(1.375rem * var(--ui-scale, 1)); }
+
+@media (width <= 1300px) {
+	:root { font-size: calc(1.2rem * var(--ui-scale, 1)); }
+}
+
+input[type="range"] {
+	width: 220px;
+	accent-color: var(--golden-orange);
+}
+
+/* ── C-frame bottom closure (layout option) ────────────────────────────── */
+
+.frame-close-left {
+	flex: none;
+	width: var(--lfw);
+	min-height: 90px;
+	display: flex;
+	align-items: flex-end;
+	justify-content: flex-end;
+	padding: var(--left-frame-padding);
+	background-color: var(--left-frame-color);
+	border-radius: var(--radius-top);
+	font-size: clamp(.875rem, 2vw, 1rem);
+	font-weight: bold;
+	text-align: right;
+	color: black;
+}
+
+.frame-close-right {
+	flex: 1;
+	position: relative;
+	display: flex;
+	flex-direction: column;
+	justify-content: flex-end;
+}
+
+.frame-close-right::before {
+	content: '';
+	width: 60px;
+	height: 60px;
+	background-color: var(--left-frame-color);
+	position: absolute;
+	left: 0;
+	bottom: var(--bar-height);
+	z-index: -1;
+}
+
+.frame-close-right::after {
+	content: '';
+	width: 60px;
+	height: 60px;
+	background-color: black;
+	border-radius: var(--radius-content-top);
+	position: absolute;
+	left: 0;
+	bottom: var(--bar-height);
+	z-index: -1;
+}
+
+.frame-close-right .bar-8 { align-self: flex-end; }
+
+/* ── nav state ─────────────────────────────────────────────────────────── */
+
+nav button.nav-current {
+	background-color: var(--space-white) !important;
+	animation: none !important;
+}
+
+/* ── status band (fleet page) ──────────────────────────────────────────── */
+
+.stat-row {
+	display: flex;
+	flex-wrap: wrap;
+	gap: .4rem;
+	margin-block: 1.5rem;
+	align-items: stretch;
+}
+
+.stat-block {
+	flex: 1;
+	min-width: 120px;
+	display: flex;
+	flex-direction: column;
+	justify-content: flex-end;
+	align-items: flex-end;
+	min-height: 84px;
+	padding: .5rem .9rem;
+	border-radius: .35rem;
+	color: black;
+}
+
+.stat-row .stat-block:first-child { border-radius: 100vmax .35rem .35rem 100vmax; }
+
+.stat-block small {
+	font-size: .65rem;
+	font-weight: bold;
+	text-transform: uppercase;
+	letter-spacing: .06em;
+}
+
+.stat-block strong {
+	font-size: 2.3rem;
+	font-weight: bold;
+	line-height: 1;
+}
+
+/* quota telemetry bars, right side of the status band */
+
+.quota-bars {
+	flex: 1.6;
+	min-width: 250px;
+	display: flex;
+	flex-direction: column;
+	justify-content: center;
+	gap: .4rem;
+	padding: .4rem .9rem .4rem .4rem;
+	border-radius: .35rem 100vmax 100vmax .35rem;
+	border: 1px solid var(--gray);
+}
+
+.quota-row {
+	display: flex;
+	align-items: center;
+	gap: .6rem;
+	font-size: .7rem;
+	text-transform: uppercase;
+	color: var(--almond);
+}
+
+.quota-row .quota-label { flex: 1; text-align: right; }
+
+.quota-track {
+	width: 110px;
+	height: .5rem;
+	border-radius: 100vmax;
+	background: #16161f;
+	overflow: hidden;
+}
+
+.quota-fill {
+	display: block;
+	height: 100%;
+	border-radius: 100vmax;
+	background: var(--golden-orange);
+}
+
+.quota-num { min-width: 46px; color: var(--space-white); text-align: right; }
+.quota-num span { color: var(--gray); }
+
+/* ── VM cards ──────────────────────────────────────────────────────────── */
+
+.vm-grid {
+	display: grid;
+	gap: 1.4rem;
+	grid-template-columns: repeat(auto-fit, minmax(330px, 1fr));
+	margin-block: 1.25rem;
+}
+
+.vm-card { min-width: 0; }
+
+.vm-card-head {
+	display: flex;
+	justify-content: space-between;
+	align-items: flex-end;
+	gap: .75rem;
+	padding: .45rem 1.1rem;
+	border-radius: 100vmax;
+	color: black;
+	font-weight: bold;
+	text-transform: uppercase;
+}
+
+.vm-card-head .vm-state { font-size: .7rem; }
+.vm-card-head strong    { font-size: 1.15rem; }
+
+.role-management { background-color: var(--golden-orange); }
+.role-worker     { background-color: var(--butterscotch); }
+.role-laboratory { background-color: var(--bluey); }
+.role-default    { background-color: var(--african-violet); }
+
+.vm-fields { margin-block: .8rem .4rem; }
+
+.vm-field {
+	display: flex;
+	justify-content: space-between;
+	align-items: baseline;
+	gap: 1rem;
+	padding: .22rem 0;
+	border-bottom: 1px solid #1c1c2a;
+	font-size: .78rem;
+}
+
+.vm-field b {
+	font-weight: normal;
+	font-size: .68rem;
+	text-transform: uppercase;
+	letter-spacing: .05em;
+	color: var(--almond);
+	white-space: nowrap;
+}
+
+.vm-field span {
+	color: var(--sunflower);
+	text-align: right;
+	text-transform: uppercase;
+	overflow-wrap: anywhere;
+}
+
+.vm-notes { font-size: .72rem; color: var(--gray); margin-block: .3rem; }
+
+/* small pill buttons (card actions, vm/service pickers) */
+
+.btn-row {
+	display: flex;
+	flex-wrap: wrap;
+	gap: .4rem;
+	margin-block: .6rem;
+}
+
+.btn-row a,
+.btn-row button {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	padding: .28rem 1rem;
+	border: none;
+	border-radius: 100vmax;
+	background-color: var(--button-color);
+	color: black;
+	font-size: .7rem;
+	font-weight: bold;
+	text-transform: uppercase;
+	text-decoration: none;
+	cursor: pointer;
+	-webkit-user-select: none;
+	user-select: none;
+}
+
+.btn-row a.current,
+.btn-row button.current { background-color: var(--space-white) !important; }
+
+/* workload sections inside a card */
+
+.vm-sec { margin-top: .85rem; }
+
+.vm-sec-label {
+	display: flex;
+	align-items: center;
+	gap: .5rem;
+	font-size: .68rem;
+	font-weight: bold;
+	letter-spacing: .08em;
+	text-transform: uppercase;
+	color: var(--golden-orange);
+}
+
+.vm-sec-label::before {
+	content: '';
+	flex: none;
+	width: 1.7rem;
+	height: .8rem;
+	border-radius: 100vmax;
+	background-color: var(--golden-orange);
+}
+
+.work-row {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	gap: .6rem;
+	padding: .3rem 0 .3rem 2.2rem;
+	border-bottom: 1px solid #14141f;
+	font-size: .78rem;
+}
+
+.work-row > div { min-width: 0; }
+
+.work-label      { color: var(--space-white); text-transform: uppercase; }
+a.work-label     { color: var(--ice); text-decoration: none; }
+a.work-label:hover { filter: brightness(120%); text-decoration: underline; }
+
+.work-note { font-size: .68rem; color: var(--gray); line-height: 1.3; }
+
+.work-empty { padding: .25rem 0 .25rem 2.2rem; font-size: .7rem; color: var(--gray); }
+
+.svc-actions { display: flex; gap: .3rem; flex: none; }
+
+.svc-actions button {
+	width: 1.7rem;
+	height: 1.15rem;
+	border: none;
+	border-radius: 100vmax;
+	color: black;
+	font-size: .62rem;
+	line-height: 1;
+	cursor: pointer;
+}
+
+/* ── badges ────────────────────────────────────────────────────────────── */
+
+.badge {
+	display: inline-block;
+	padding: .08rem .6rem;
+	border-radius: 100vmax;
+	color: black;
+	font-size: .66rem;
+	font-weight: bold;
+	text-transform: uppercase;
+	white-space: nowrap;
+}
+
+.badge-running      { background-color: var(--gold); }
+.badge-provisioning,
+.badge-starting     { background-color: var(--sunglow); }
+.badge-pending      { background-color: var(--bluey); }
+.badge-done         { background-color: var(--lima-bean); }
+.badge-failed,
+.badge-terminated,
+.badge-terminating  { background-color: var(--tomato); }
+.badge-unknown      { background-color: var(--gray); }
+
+.warn-text { color: var(--tomato); }
+.muted     { color: var(--gray); }
+
+/* ── log / stats readouts ──────────────────────────────────────────────── */
+
+pre.readout {
+	margin-block: 1.25rem;
+	padding: .9rem 1.1rem;
+	background: black;
+	border: 1px solid #2a2a3d;
+	border-left: .5rem solid var(--african-violet);
+	border-radius: 0 .5rem .5rem 0;
+	overflow-x: auto;
+	white-space: pre;
+	font-family: monospace;
+	font-size: .68rem;
+	line-height: 1.5;
+	color: var(--sunflower);
+}
+
+pre.readout.wrap-lines { white-space: pre-wrap; }
+
+.meta-line {
+	font-size: .7rem;
+	text-transform: uppercase;
+	color: var(--gray);
+	margin-block: .5rem;
+}
+
+/* ── tables (queue page) ───────────────────────────────────────────────── */
+
+.table-scroll { overflow-x: auto; }
+
+.lcars-table {
+	width: 100%;
+	border-collapse: collapse;
+	margin-block: .75rem 1.5rem;
+	font-size: .74rem;
+}
+
+.lcars-table th {
+	padding: .3rem .55rem;
+	border-bottom: 2px solid var(--golden-orange);
+	text-align: left;
+	text-transform: uppercase;
+	font-size: .62rem;
+	letter-spacing: .08em;
+	color: var(--golden-orange);
+}
+
+.lcars-table td {
+	padding: .4rem .55rem;
+	border-bottom: 1px solid #1c1c2a;
+	vertical-align: top;
+	color: var(--space-white);
+}
+
+.job-output {
+	max-height: 90px;
+	overflow-y: auto;
+	font-family: monospace;
+	font-size: .64rem;
+	white-space: pre-wrap;
+	color: var(--gray);
+}
+
+/* ── event + audit rows ────────────────────────────────────────────────── */
+
+.ev-row, .audit-row {
+	display: flex;
+	gap: .8rem;
+	align-items: baseline;
+	padding: .35rem 0;
+	border-bottom: 1px solid #1c1c2a;
+	font-size: .76rem;
+}
+
+.ev-vm    { min-width: 100px; color: var(--golden-orange); text-transform: uppercase; font-weight: bold; }
+.ev-type  { flex: 1; color: var(--space-white); }
+.ev-time  { color: var(--gray); white-space: nowrap; }
+
+.audit-ts  { min-width: 128px; color: var(--gray); white-space: nowrap; }
+.audit-who { min-width: 90px; color: var(--almond); }
+.audit-act { min-width: 120px; color: var(--golden-orange); text-transform: uppercase; }
+.audit-vm  { min-width: 90px; color: var(--bluey); text-transform: uppercase; }
+.audit-det { flex: 1; color: var(--gray); font-family: monospace; font-size: .68rem; overflow-wrap: anywhere; }
+
+/* ── forms (login, tools) ──────────────────────────────────────────────── */
+
+.lcars-form label {
+	display: block;
+	margin-bottom: .3rem;
+	font-size: .7rem;
+	font-weight: bold;
+	text-transform: uppercase;
+	letter-spacing: .08em;
+	color: var(--almond);
+}
+
+.lcars-form input[type="text"],
+.lcars-form input[type="password"] {
+	width: 100%;
+	margin-bottom: 1.1rem;
+	padding: .5rem 1.1rem;
+	background: black;
+	border: 2px solid var(--gray);
+	border-radius: 100vmax;
+	color: var(--space-white);
+	font-size: .9rem;
+	outline: none;
+}
+
+.lcars-form input:focus { border-color: var(--golden-orange); }
+
+.login-panel {
+	max-width: 430px;
+	margin: 8vh auto 3rem;
+}
+
+.login-panel .buttons { margin-block: 1rem; }
+
+.error-msg {
+	margin-block: 1rem;
+	font-size: .8rem;
+	text-transform: uppercase;
+	color: var(--tomato);
+}
+
+/* tools page */
+
+.tool-grid {
+	display: grid;
+	gap: .75rem;
+	grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+	margin-block: 1rem;
+}
+
+.tool-card {
+	display: flex;
+	flex-direction: column;
+	align-items: flex-end;
+	gap: .15rem;
+	padding: .7rem 1.2rem .8rem;
+	border: none;
+	border-radius: 1.4rem;
+	color: black;
+	text-align: right;
+	cursor: pointer;
+}
+
+.tool-card.selected { outline: 3px solid var(--space-white); }
+
+.tool-title { font-size: .85rem; font-weight: bold; text-transform: uppercase; }
+.tool-desc  { font-size: .68rem; line-height: 1.25; }
+
+.script-editor {
+	width: 100%;
+	min-height: 150px;
+	margin-block: .75rem;
+	padding: .8rem 1rem;
+	background: black;
+	border: 2px solid var(--gray);
+	border-radius: .75rem;
+	color: var(--space-white);
+	font-family: monospace;
+	font-size: .72rem;
+	line-height: 1.5;
+	resize: vertical;
+	outline: none;
+}
+
+.script-editor:focus { border-color: var(--golden-orange); }
+
+.run-bar {
+	display: flex;
+	flex-wrap: wrap;
+	gap: .6rem;
+	align-items: center;
+	margin-block: .75rem;
+}
+
+.vm-select {
+	padding: .35rem 1.1rem;
+	background: black;
+	border: 2px solid var(--gray);
+	border-radius: 100vmax;
+	color: var(--space-white);
+	font-size: .78rem;
+	text-transform: uppercase;
+	outline: none;
+}
+
+.run-status { font-size: .72rem; text-transform: uppercase; color: var(--gray); }

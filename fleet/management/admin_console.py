@@ -13,6 +13,8 @@ Endpoints:
   GET  /export              Fleet connection details (login required)
   GET  /stats?vm=<name>     Live system stats (login required)
   GET  /logs?vm=<name>&service=<svc>  Journalctl logs (login required)
+  GET  /settings            LCARS mode settings — layout, scale, audio (login required)
+  GET  /static/...          LCARS framework assets (css, fonts, beeps)
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ import hashlib
 import html
 import json
 import os
+import random
 import re
 import secrets
 import shlex
@@ -45,6 +48,8 @@ FLEET_NAME = os.getenv("FLEET_NAME", "Cloud Lab")
 DEV_MODE   = os.getenv("DEV_MODE", "") == "1" or "--dev" in __import__("sys").argv
 TOOLS_DIR  = Path(os.getenv("CLOUD_LAB_DIR",
              str(Path.home() / "cloud-lab"))).expanduser()
+STATIC_DIR       = Path(__file__).resolve().parents[2] / "static"
+STATIC_ASSET_VERSION = "thelcars-v26-1"
 PROFILE_DIR     = TOOLS_DIR / "vm-profiles"
 HEARTBEATS_FILE = TOOLS_DIR / "vm-profiles" / "_heartbeats.json"
 AUDIT_LOG        = TOOLS_DIR / "logs" / "audit.jsonl"
@@ -53,6 +58,14 @@ HEARTBEAT_TOKEN  = os.getenv("FLEET_HEARTBEAT_TOKEN", "")
 
 COOKIE_NAME      = "fleet_session"
 SESSION_DURATION = 7 * 24 * 3600   # 7 days
+
+# Default interface: "standard" (classic dashboard) or "lcars".
+# Users switch at runtime via settings; choice persists in a cookie.
+DEFAULT_UI_MODE = os.getenv("CONSOLE_DEFAULT_UI", "standard")
+
+# Per-request LCARS presentation state (layout + scale), set from cookies by
+# the handler before rendering. Thread-local because the server is threaded.
+_ui_ctx = threading.local()
 
 _sessions: dict[str, float] = {}
 _sessions_lock = threading.Lock()
@@ -67,24 +80,10 @@ _quota_cache: dict = {}
 _quota_cache_ts: float = 0.0
 _QUOTA_TTL: float = 3600.0  # quota refreshes every hour
 
-# Minimal server-rack SVG used as placeholder when no custom logo is configured.
-_DEFAULT_LOGO = (
-    "data:image/svg+xml;charset=utf-8,"
-    "%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 36 36' fill='none'"
-    " stroke='rgba(255,255,255,.85)' stroke-width='2'"
-    " stroke-linecap='round' stroke-linejoin='round'%3E"
-    "%3Crect x='3' y='5' width='30' height='9' rx='2'/%3E"
-    "%3Crect x='3' y='18' width='30' height='9' rx='2'/%3E"
-    "%3Ccircle cx='29' cy='9.5' r='1.5' fill='%234ade80' stroke='none'/%3E"
-    "%3Ccircle cx='29' cy='22.5' r='1.5' fill='%23f59e0b' stroke='none'/%3E"
-    "%3C/svg%3E"
-)
-
 _login_fails: dict[str, tuple[int, float]] = {}
 _fails_lock  = threading.Lock()
 MAX_LOGIN_ATTEMPTS = 5
 LOCKOUT_SECONDS    = 900
-_ACT = 'class="active"'   # used in f-string nav links (backslashes not allowed in f-expr)
 
 MAX_LOGIN_BODY      = 8_192
 MAX_HEARTBEAT_BODY  = 16_384
@@ -437,7 +436,276 @@ def _write_audit(action: str, vm: str, details: str,
         fh.write(json.dumps(entry) + "\n")
 
 
-def _mgmt_tls_html() -> str:
+def _lcars_mgmt_tls_html() -> str:
+    """Return HTML rows for TLS cert expiry and DuckDNS status (management card only)."""
+    import subprocess as _sp, datetime as _dt
+    rows = []
+    cert_file: Path | None = None
+    for cert_root in [
+        Path.home() / ".local" / "share" / "caddy" / "certificates",
+        Path("/var/lib/caddy/.local/share/caddy/certificates"),
+        Path("/etc/caddy/certificates"),
+    ]:
+        try:
+            root_exists = cert_root.exists()
+        except PermissionError:
+            root_exists = False
+        if root_exists:
+            try:
+                for crt in sorted(cert_root.rglob("*.crt"), key=lambda p: p.stat().st_mtime, reverse=True):
+                    cert_file = crt
+                    break
+            except PermissionError:
+                pass
+        if cert_file:
+            break
+    if cert_file:
+        try:
+            out  = _sp.check_output(["openssl", "x509", "-enddate", "-noout", "-in", str(cert_file)],
+                                    text=True, stderr=_sp.DEVNULL, timeout=5).strip()
+            date_str = out.split("=", 1)[1].strip()
+            exp  = _dt.datetime.strptime(date_str, "%b %d %H:%M:%S %Y %Z").replace(tzinfo=_dt.timezone.utc)
+            days = (exp - _dt.datetime.now(_dt.timezone.utc)).days
+            cls  = ' class="warn-text"' if days < 14 else ""
+            rows.append(f'<div class="vm-field"><b>TLS cert</b>'
+                        f'<span{cls}>expires in {days}d ({exp.strftime("%Y-%m-%d")})</span></div>')
+        except Exception:
+            rows.append('<div class="vm-field"><b>TLS cert</b><span class="muted">unable to read</span></div>')
+    else:
+        rows.append('<div class="vm-field"><b>TLS cert</b><span class="muted">not configured</span></div>')
+    for log_path in [TOOLS_DIR / "logs" / "duckdns.log",
+                     Path.home() / ".config" / "cloud-lab" / "duckdns.log"]:
+        if log_path.exists():
+            try:
+                last = log_path.read_text(encoding="utf-8").strip().splitlines()[-1]
+                rows.append(f'<div class="vm-field"><b>DuckDNS</b>'
+                            f'<span class="muted">{html.escape(last[:80])}</span></div>')
+            except Exception:
+                pass
+            break
+    return "".join(rows)
+
+
+def _update_quota_cache() -> None:
+    global _quota_cache, _quota_cache_ts
+    import time as _t
+    now = _t.monotonic()
+    if now - _quota_cache_ts < _QUOTA_TTL:
+        return
+    env = _mgmt_env()
+    compartment_id = env.get("OCI_COMPARTMENT_ID", "")
+    if not compartment_id:
+        return
+    # Known Always Free maximums — used as fallback when OCI API is unreachable.
+    # A1 values updated June 2026 after Oracle halved the free-tier allocation.
+    _AF_MAX = {
+        "E2.Micro VMs": 2,
+        "A1 OCPUs":     2,
+        "A1 RAM (GB)":  12,
+    }
+    limits = {}
+    for limit_name, label in [
+        ("standard-e2-micro-count",   "E2.Micro VMs"),
+        ("standard-a1-ocpus",         "A1 OCPUs"),
+        ("standard-a1-memory-in-gbs", "A1 RAM (GB)"),
+    ]:
+        try:
+            data = oci_cmd(["limits", "resource-availability", "get",
+                            "--compartment-id", compartment_id,
+                            "--service-name", "compute",
+                            "--limit-name", limit_name], timeout=30).get("data", {})
+            quota = data.get("effective-quota-value") or _AF_MAX.get(label, "?")
+            limits[label] = {"used": data.get("used", "?"), "quota": quota}
+        except Exception as exc:
+            print(f"[quota] {label} ({limit_name}): {exc!s:.300}", flush=True)
+            limits[label] = {"used": "?", "quota": _AF_MAX.get(label, "?")}
+    _quota_cache    = limits
+    _quota_cache_ts = now
+
+
+def _quota_bars() -> str:
+    """Oracle free-tier quota telemetry bars for the fleet status band."""
+    fallback = {
+        "E2.Micro VMs": {"used": "?", "quota": 2},
+        "A1 OCPUs": {"used": "?", "quota": 2},
+        "A1 RAM (GB)": {"used": "?", "quota": 12},
+    }
+    data = _quota_cache or fallback
+    rows = []
+    for label in ("E2.Micro VMs", "A1 OCPUs", "A1 RAM (GB)"):
+        item = data.get(label, fallback[label])
+        used = item.get("used", "?")
+        quota = item.get("quota", "?")
+        try:
+            pct = max(0, min(100, int((float(used) / float(quota)) * 100)))
+        except Exception:
+            pct = 6
+        rows.append(
+            '<div class="quota-row">'
+            f'<span class="quota-label">{html.escape(label)}</span>'
+            '<span class="quota-track">'
+            f'<span class="quota-fill" style="width:{pct}%"></span>'
+            '</span>'
+            f'<span class="quota-num">{html.escape(str(used))}<span>/{html.escape(str(quota))}</span></span>'
+            '</div>'
+        )
+    return '<div class="quota-bars">' + "".join(rows) + '</div>'
+
+
+def _read_vm_queue(vm_name: str) -> list[dict]:
+    if vm_name == "management":
+        p = TOOLS_DIR / "queue.json"
+        try: return json.loads(p.read_text(encoding="utf-8"))
+        except Exception: return []
+    raw = _ssh_run(vm_name, "cat ~/cloud-lab/queue.json 2>/dev/null || echo '[]'", timeout=10)
+    try: return json.loads(raw)
+    except Exception: return []
+
+
+def _read_vm_crontab(vm_name: str) -> str:
+    if vm_name == "management":
+        try:
+            result = subprocess.run(["crontab", "-l"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=5)
+            return result.stdout or "(no crontab)"
+        except Exception as exc: return f"Error: {exc}"
+    return _ssh_run(vm_name, "crontab -l 2>&1 || echo '(no crontab)'", timeout=10)
+
+
+def _lcars_svc_row(name: str, svc: str, label: str, note: str = "") -> str:
+    vm_h  = html.escape(name)
+    svc_h = html.escape(svc)
+    lbl_h = html.escape(label)
+    note_h = f'<div class="work-note">{html.escape(note)}</div>' if note else ""
+    if not svc:
+        return (
+            f'<div class="work-row"><div>'
+            f'<div class="work-label">{lbl_h}</div>{note_h}'
+            f'</div></div>'
+        )
+    return (
+        f'<div class="work-row"><div>'
+        f'<a class="work-label" href="/logs?vm={vm_h}&service={svc_h}">{lbl_h}</a>{note_h}'
+        f'</div><div class="svc-actions">'
+        f'<button class="background-bluey" title="restart" data-vm="{vm_h}" data-svc="{svc_h}"'
+        f' onclick="svcCtl(this.dataset.vm,this.dataset.svc,&apos;restart&apos;)">&#x21BA;</button>'
+        f'<button class="background-tomato" title="stop" data-vm="{vm_h}" data-svc="{svc_h}"'
+        f' onclick="svcCtl(this.dataset.vm,this.dataset.svc,&apos;stop&apos;)">&#x25A0;</button>'
+        f'<button class="background-lima-bean" title="start" data-vm="{vm_h}" data-svc="{svc_h}"'
+        f' onclick="svcCtl(this.dataset.vm,this.dataset.svc,&apos;start&apos;)">&#x25BA;</button>'
+        f'</div></div>'
+    )
+
+
+def _lcars_plain_work_row(label: str, note: str = "", status: str = "") -> str:
+    status_h = (
+        f'<span class="badge badge-{html.escape(status.lower())}">{html.escape(status)}</span>'
+        if status else ""
+    )
+    note_h = f'<div class="work-note">{html.escape(note)}</div>' if note else ""
+    return (
+        f'<div class="work-row"><div>'
+        f'<div class="work-label">{html.escape(label)}</div>{note_h}'
+        f'</div>{status_h}</div>'
+    )
+
+
+def _lcars_work_section(title: str, rows: str) -> str:
+    if not rows:
+        rows = '<div class="work-empty">&mdash; none &mdash;</div>'
+    return (
+        f'<div class="vm-sec">'
+        f'<div class="vm-sec-label">{html.escape(title)}</div>'
+        f'{rows}'
+        f'</div>'
+    )
+
+
+def _queue_sections(name: str, row) -> tuple[str, str, str]:
+    """Shared queue summary; `row(label, note, status)` builds one row."""
+    jobs = _read_vm_queue(name)
+    running = [j for j in jobs if j.get("status") == "running"]
+    pending = [j for j in jobs if j.get("status") == "pending"]
+    completed = [j for j in jobs if j.get("status") in ("done", "failed")]
+    pending.sort(key=lambda j: (j.get("priority", 5), j.get("queued_at", "")))
+    completed.sort(key=lambda j: j.get("completed_at") or "", reverse=True)
+
+    active_rows = "".join(
+        row(j.get("label", "Queued job"), j.get("started_at", ""), "running")
+        for j in running[:2]
+    )
+    queue_rows = "".join(
+        row(
+            j.get("label", "Queued job"),
+            f'priority {j.get("priority", 5)} · queued {(j.get("queued_at") or "")[:16]}',
+            "pending",
+        )
+        for j in pending[:3]
+    )
+    done_rows = "".join(
+        row(
+            j.get("label", "Queued job"),
+            f'exit {j.get("exit_code", "")} · {(j.get("completed_at") or "")[:16]}',
+            j.get("status", ""),
+        )
+        for j in completed[:2]
+    )
+    return active_rows, queue_rows, done_rows
+
+
+_CONSOLE_SVC = "cloud-lab-console"
+_SELF_RESTART_RE = re.compile(
+    r'(sudo\s+)?systemctl\s+(restart|start)\s+cloud-lab-console'
+)
+
+def _defer_console_restart() -> None:
+    """Restart the console service after a short delay so the HTTP response can be flushed first."""
+    time.sleep(1.5)
+    subprocess.run(["sudo", "systemctl", "restart", _CONSOLE_SVC],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _run_service_control(vm_name: str, service: str, action: str) -> tuple[int, str]:
+    safe_svc = service if re.match(r"^cloud-lab-[a-z0-9_-]+$", service) else ""
+    if not safe_svc: return 1, f"Disallowed service name: {service!r}"
+    safe_action = action if action in ("start", "stop", "restart", "status") else ""
+    if not safe_action: return 1, f"Disallowed action: {action!r}"
+    cmd = f"sudo systemctl {safe_action} {safe_svc} 2>&1; sudo systemctl status {safe_svc} --no-pager 2>&1 | head -20"
+    if vm_name == "management":
+        if safe_svc == _CONSOLE_SVC and safe_action in ("restart", "start"):
+            threading.Thread(target=_defer_console_restart, daemon=True).start()
+            return 0, f"[{_CONSOLE_SVC}] restarting — page will reload in a few seconds"
+        try:
+            result = subprocess.run(["bash", "-c", cmd],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15)
+            return result.returncode, result.stdout or "(no output)"
+        except Exception as exc: return 1, f"Error: {exc}"
+    return 0, _ssh_run(vm_name, cmd, timeout=20)
+
+
+
+# ═══ STANDARD UI ══════════════════════════════════════════════════════════════
+# The classic dashboard renderer — default interface. Palettes, dark mode and
+# the switch into LCARS mode live in its gear settings panel.
+
+# Minimal server-rack SVG used as placeholder when no custom logo is configured.
+_DEFAULT_LOGO = (
+    "data:image/svg+xml;charset=utf-8,"
+    "%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 36 36' fill='none'"
+    " stroke='rgba(255,255,255,.85)' stroke-width='2'"
+    " stroke-linecap='round' stroke-linejoin='round'%3E"
+    "%3Crect x='3' y='5' width='30' height='9' rx='2'/%3E"
+    "%3Crect x='3' y='18' width='30' height='9' rx='2'/%3E"
+    "%3Ccircle cx='29' cy='9.5' r='1.5' fill='%234ade80' stroke='none'/%3E"
+    "%3Ccircle cx='29' cy='22.5' r='1.5' fill='%23f59e0b' stroke='none'/%3E"
+    "%3C/svg%3E"
+)
+
+
+_ACT = 'class="active"'   # used in f-string nav links (backslashes not allowed in f-expr)
+
+
+def _std_mgmt_tls_html() -> str:
     """Return HTML rows for TLS cert expiry and DuckDNS status (management card only)."""
     import subprocess as _sp, datetime as _dt
     rows = []
@@ -484,42 +752,6 @@ def _mgmt_tls_html() -> str:
             break
     return "".join(rows)
 
-
-def _update_quota_cache() -> None:
-    global _quota_cache, _quota_cache_ts
-    import time as _t
-    now = _t.monotonic()
-    if now - _quota_cache_ts < _QUOTA_TTL:
-        return
-    env = _mgmt_env()
-    compartment_id = env.get("OCI_COMPARTMENT_ID", "")
-    if not compartment_id:
-        return
-    # Known Always Free maximums — used as fallback when OCI API is unreachable.
-    # A1 values updated June 2026 after Oracle halved the free-tier allocation.
-    _AF_MAX = {
-        "E2.Micro VMs": 2,
-        "A1 OCPUs":     2,
-        "A1 RAM (GB)":  12,
-    }
-    limits = {}
-    for limit_name, label in [
-        ("standard-e2-micro-count",   "E2.Micro VMs"),
-        ("standard-a1-ocpus",         "A1 OCPUs"),
-        ("standard-a1-memory-in-gbs", "A1 RAM (GB)"),
-    ]:
-        try:
-            data = oci_cmd(["limits", "resource-availability", "get",
-                            "--compartment-id", compartment_id,
-                            "--service-name", "compute",
-                            "--limit-name", limit_name], timeout=30).get("data", {})
-            quota = data.get("effective-quota-value") or _AF_MAX.get(label, "?")
-            limits[label] = {"used": data.get("used", "?"), "quota": quota}
-        except Exception as exc:
-            print(f"[quota] {label} ({limit_name}): {exc!s:.300}", flush=True)
-            limits[label] = {"used": "?", "quota": _AF_MAX.get(label, "?")}
-    _quota_cache    = limits
-    _quota_cache_ts = now
 
 
 def _quota_html() -> str:
@@ -577,27 +809,8 @@ def _quota_html() -> str:
     return "\n".join(rows)
 
 
-def _read_vm_queue(vm_name: str) -> list[dict]:
-    if vm_name == "management":
-        p = TOOLS_DIR / "queue.json"
-        try: return json.loads(p.read_text(encoding="utf-8"))
-        except Exception: return []
-    raw = _ssh_run(vm_name, "cat ~/cloud-lab/queue.json 2>/dev/null || echo '[]'", timeout=10)
-    try: return json.loads(raw)
-    except Exception: return []
 
-
-def _read_vm_crontab(vm_name: str) -> str:
-    if vm_name == "management":
-        try:
-            result = subprocess.run(["crontab", "-l"],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=5)
-            return result.stdout or "(no crontab)"
-        except Exception as exc: return f"Error: {exc}"
-    return _ssh_run(vm_name, "crontab -l 2>&1 || echo '(no crontab)'", timeout=10)
-
-
-def _svc_row(name: str, svc: str, label: str, note: str = "") -> str:
+def _std_svc_row(name: str, svc: str, label: str, note: str = "") -> str:
     vm_h  = html.escape(name)
     svc_h = html.escape(svc)
     lbl_h = html.escape(label)
@@ -619,13 +832,13 @@ def _svc_row(name: str, svc: str, label: str, note: str = "") -> str:
     )
 
 
-def _plain_work_row(label: str, note: str = "", status: str = "") -> str:
+def _std_plain_work_row(label: str, note: str = "", status: str = "") -> str:
     status_h = f'<span class="mini-badge {html.escape(status.lower())}">{html.escape(status)}</span>' if status else ""
     note_h = f'<div class="svc-note">{html.escape(note)}</div>' if note else ""
     return f'<tr><td>{html.escape(label)}{note_h}</td><td>{status_h}</td></tr>'
 
 
-def _work_section(title: str, rows: str) -> str:
+def _std_work_section(title: str, rows: str) -> str:
     if not rows:
         rows = '<tr><td colspan="2" class="empty-row">None right now.</td></tr>'
     return (
@@ -636,71 +849,8 @@ def _work_section(title: str, rows: str) -> str:
     )
 
 
-def _queue_sections(name: str) -> tuple[str, str, str]:
-    jobs = _read_vm_queue(name)
-    running = [j for j in jobs if j.get("status") == "running"]
-    pending = [j for j in jobs if j.get("status") == "pending"]
-    completed = [j for j in jobs if j.get("status") in ("done", "failed")]
-    pending.sort(key=lambda j: (j.get("priority", 5), j.get("queued_at", "")))
-    completed.sort(key=lambda j: j.get("completed_at") or "", reverse=True)
 
-    active_rows = "".join(
-        _plain_work_row(j.get("label", "Queued job"), j.get("started_at", ""), "running")
-        for j in running[:2]
-    )
-    queue_rows = "".join(
-        _plain_work_row(
-            j.get("label", "Queued job"),
-            f'priority {j.get("priority", 5)} · queued {(j.get("queued_at") or "")[:16]}',
-            "pending",
-        )
-        for j in pending[:3]
-    )
-    done_rows = "".join(
-        _plain_work_row(
-            j.get("label", "Queued job"),
-            f'exit {j.get("exit_code", "")} · {(j.get("completed_at") or "")[:16]}',
-            j.get("status", ""),
-        )
-        for j in completed[:2]
-    )
-    return active_rows, queue_rows, done_rows
-
-
-_CONSOLE_SVC = "cloud-lab-console"
-_SELF_RESTART_RE = re.compile(
-    r'(sudo\s+)?systemctl\s+(restart|start)\s+cloud-lab-console'
-)
-
-def _defer_console_restart() -> None:
-    """Restart the console service after a short delay so the HTTP response can be flushed first."""
-    time.sleep(1.5)
-    subprocess.run(["sudo", "systemctl", "restart", _CONSOLE_SVC],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-
-def _run_service_control(vm_name: str, service: str, action: str) -> tuple[int, str]:
-    safe_svc = service if re.match(r"^cloud-lab-[a-z0-9_-]+$", service) else ""
-    if not safe_svc: return 1, f"Disallowed service name: {service!r}"
-    safe_action = action if action in ("start", "stop", "restart", "status") else ""
-    if not safe_action: return 1, f"Disallowed action: {action!r}"
-    cmd = f"sudo systemctl {safe_action} {safe_svc} 2>&1; sudo systemctl status {safe_svc} --no-pager 2>&1 | head -20"
-    if vm_name == "management":
-        if safe_svc == _CONSOLE_SVC and safe_action in ("restart", "start"):
-            threading.Thread(target=_defer_console_restart, daemon=True).start()
-            return 0, f"[{_CONSOLE_SVC}] restarting — page will reload in a few seconds"
-        try:
-            result = subprocess.run(["bash", "-c", cmd],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15)
-            return result.returncode, result.stdout or "(no output)"
-        except Exception as exc: return 1, f"Error: {exc}"
-    return 0, _ssh_run(vm_name, cmd, timeout=20)
-
-# ── CSS / JS constants ────────────────────────────────────────────────────────
-
-# Default palette: Slate — neutral, works with any branding.
-# Users can switch palettes at runtime via the settings panel.
-PALETTE_CSS = """
+STD_PALETTE_CSS = """
 :root {
   --c-primary:    #374151;
   --c-primary-lt: #4b5563;
@@ -729,7 +879,7 @@ PALETTE_CSS = """
 }
 """
 
-COMMON_CSS = PALETTE_CSS + """
+STD_CSS = STD_PALETTE_CSS + """
 *, *::before, *::after { box-sizing: border-box; }
 body { font-family: system-ui,-apple-system,sans-serif; margin: 0;
        background: var(--c-bg); color: var(--c-text);
@@ -962,7 +1112,7 @@ footer { text-align: center; font-size: 12px; color: var(--c-muted); padding: 20
 """
 
 # localStorage keys use a generic 'fleet-' prefix.
-THEME_JS = """
+STD_THEME_JS = """
 (function() {
   var r = document.documentElement;
   var pal = localStorage.getItem('fleet-palette');
@@ -1053,6 +1203,11 @@ function applyCustomPalette() {
   document.querySelectorAll('.palette-btn').forEach(function(b) { b.classList.remove('active'); });
 }
 
+function setUiMode(mode) {
+  document.cookie = 'fleet_ui_mode=' + mode + '; Path=/; SameSite=Strict; Max-Age=31536000';
+  window.location.href = '/';
+}
+
 async function svcCtl(vm, svc, action) {
   if (!confirm(action + " " + svc + " on " + vm + "?")) return;
   var r;
@@ -1074,7 +1229,7 @@ function copyText(text, btn) {
 }
 """
 
-# Six named presets + the Custom slot rendered separately in _topbar().
+# Six named presets + the Custom slot rendered separately in _std_topbar().
 # Tuple: (name, btn_bg, theme, vars)
 # vars sets ALL CSS custom properties — palette is a complete visual identity.
 # theme is 'light' or 'dark'; applyPalette forces data-theme to match.
@@ -1116,6 +1271,606 @@ PALETTE_PRESETS = [
         "--c-text": "#e2e8f0", "--c-muted": "#94a3b8",
     }),
 ]
+
+
+def _std_head(title: str, auto_refresh: int = 0) -> str:
+    refresh = f'<meta http-equiv="refresh" content="{auto_refresh}">' if auto_refresh else ""
+    return (
+        f'<!doctype html><html lang="en"><head>'
+        f'<meta charset="utf-8">'
+        f'<meta name="viewport" content="width=device-width,initial-scale=1">'
+        f'{refresh}'
+        f'<title>{html.escape(title)}</title>'
+        f'<style>{STD_CSS}</style>'
+        f'<script>{STD_THEME_JS}</script>'
+        f'</head><body>'
+    )
+
+
+_PAGE_SUBTITLES: dict[str, str] = {
+    "fleet":  "Fleet Management",
+    "stats":  "VM Stats",
+    "logs":   "Log Stream",
+    "export": "Export",
+}
+
+
+def _std_topbar(active: str = "") -> str:
+    nav_items = [
+        ("Fleet",  "/",       "fleet"),
+        ("Stats",  "/stats",  "stats"),
+        ("Logs",   "/logs",   "logs"),
+        ("Export", "/export", "export"),
+    ]
+    links = " ".join(
+        f'<a href="{href}" {_ACT if active == key else ""}>{label}</a>'
+        for label, href, key in nav_items
+    )
+    preset_btns = " ".join(
+        f'<button class="palette-btn"'
+        f' style="background:{btn_bg}"'
+        f' data-vars=\'{json.dumps(pvars)}\''
+        f' data-theme="{theme}"'
+        f' onclick="applyPalette(this)">{name}</button>'
+        for name, btn_bg, theme, pvars in PALETTE_PRESETS
+    )
+    # Custom button: diagonal split of two grays to suggest "make your own"
+    custom_btn = (
+        '<button class="palette-btn"'
+        ' style="background:linear-gradient(135deg,#4b5563 55%,#9ca3af 45%)"'
+        ' onclick="toggleCustomPanel()">Custom</button>'
+    )
+    custom_panel = (
+        '<div id="custom-panel" class="custom-panel" hidden>'
+        '<h3>Pick colors</h3>'
+        '<label>Primary <input type="color" id="cp-primary" value="#374151"></label>'
+        '<label>Primary (light) <input type="color" id="cp-primary-lt" value="#4b5563"></label>'
+        '<label>Primary (dark) <input type="color" id="cp-primary-dk" value="#1f2937"></label>'
+        '<label>Accent <input type="color" id="cp-accent" value="#f59e0b"></label>'
+        '<h3 style="margin-top:10px">Logo</h3>'
+        '<input type="url" id="cp-logo" placeholder="https://... or data:image/...">'
+        '<p class="custom-hint">'
+        'PNG or SVG &middot; transparent background &middot; ~44 px tall<br>'
+        'To embed locally: <code>base64 -w0 logo.png</code> then prefix with<br>'
+        '<code>data:image/png;base64,</code>'
+        '</p>'
+        '<button class="btn" onclick="applyCustomPalette()" style="width:100%;padding:7px;margin-top:4px">Apply</button>'
+        '</div>'
+    )
+    return (
+        f'<div class="topbar">'
+        f'<div class="topbar-left">'
+        f'<a href="/" style="display:flex;align-items:center;gap:10px;text-decoration:none">'
+        f'<img id="topbar-logo" class="topbar-logo visible" src="{_DEFAULT_LOGO}" alt="Fleet Logo">'
+        f'<span class="fleet-name">{html.escape(_PAGE_SUBTITLES.get(active, FLEET_NAME))}</span>'
+        f'</a>'
+        f'</div>'
+        f'<nav class="topbar-nav">{links}'
+        f'<button class="theme-btn" title="Appearance" onclick="toggleSettings()">&#9881;</button>'
+        f'<a href="/logout" class="sign-out">Sign out</a>'
+        f'</nav></div>'
+        f'<div id="settings-panel" class="settings-panel" hidden>'
+        f'<div class="settings-row">'
+        f'<span>Dark mode</span>'
+        f'<button class="theme-btn" onclick="toggleTheme()" style="margin-left:auto">'
+        f'<span id="theme-icon">&#127769;</span></button>'
+        f'</div>'
+        f'<h3>Interface</h3>'
+        f'<div class="settings-row" style="gap:6px">'
+        f'<button class="btn" style="flex:1;padding:7px" disabled>Standard</button>'
+        f'<button class="btn" style="flex:1;padding:7px" onclick="setUiMode(&apos;lcars&apos;)">LCARS</button>'
+        f'</div>'
+        f'<h3>Color palette</h3>'
+        f'<div class="palette-grid">{preset_btns}{custom_btn}</div>'
+        f'{custom_panel}'
+        f'</div>'
+    )
+
+
+
+def _std_vm_cards() -> str:
+    refresh_oci_snapshots()
+    fleet = load_json(TOOLS_DIR / "fleet.json") or {"vms": []}
+    with _hb_lock:
+        hbs = dict(_heartbeats)
+    env      = _mgmt_env()
+    ssh_user = env.get("OCI_SSH_USER", "ubuntu")
+
+    cards = []
+    for vm in fleet.get("vms", []):
+        name       = vm.get("name", "")
+        profile    = load_json(PROFILE_DIR / f"{name}.json") or {}
+        instance   = profile.get("instance", {})
+        state      = instance.get("lifecycle-state", "UNKNOWN")
+        shape      = html.escape(instance.get("shape") or vm.get("shape", ""))
+        public_ip  = html.escape(profile.get("public_ip") or "—")
+        private_ip = html.escape(profile.get("private_ip") or "—")
+        role       = vm.get("role", name)
+        role_label = html.escape(role)
+        notes      = html.escape(vm.get("notes", ""))
+        synced_at  = profile.get("synced_at", "")
+
+        hb = hbs.get(name, {})
+        hb_time  = hb.get("received_at", "")
+        snap_ago = fmt_ago(synced_at) if synced_at else "never"
+
+        if name == "management":
+            # Management is the heartbeat server — it never heartbeats itself.
+            # Read uptime directly from /proc/uptime instead.
+            try:
+                secs = int(float(Path("/proc/uptime").read_text().split()[0]))
+                d, rem = divmod(secs, 86400)
+                h, rem = divmod(rem, 3600)
+                m = rem // 60
+                uptime = f"{d}d {h}h {m}m" if d else f"{h}h {m}m"
+            except Exception:
+                uptime = "—"
+            hb_ago = ""   # management doesn't heartbeat to itself
+        else:
+            uptime = html.escape(hb.get("uptime", "") or "—")
+            hb_ago = fmt_ago(hb_time) if hb_time else '<span class="warn-text">not received yet</span>'
+
+        state_cls = state.lower().replace(" ", "-")
+        badge = f'<span class="badge {state_cls}">{html.escape(state)}</span>'
+
+        ssh_cmd = f"ssh -i ~/.ssh/fleet.key {ssh_user}@{public_ip}"
+
+        actions = [
+            f'<a class="act-btn" href="/stats?vm={html.escape(name)}">Live stats</a>',
+            f'<a class="act-btn" href="/logs?vm={html.escape(name)}">Logs</a>',
+        ]
+        if public_ip != "—":
+            actions.append(
+                f'<button class="act-btn" onclick="copyText({json.dumps(ssh_cmd)},this)">Copy SSH</button>'
+            )
+        actions.append(f'<a class="act-btn" href="/tools?vm={html.escape(name)}">Tools</a>')
+        if name == "worker":
+            actions.append(
+                '<a class="act-btn accent" href="/logs?vm=worker&service=cloud-lab-a1-lottery">Lottery logs</a>'
+            )
+
+        workloads = _ROLE_WORKLOADS.get(role, {})
+        queued_active, queue_rows, completed_rows = _queue_sections(name, _std_plain_work_row)
+        active_rows = queued_active + "".join(
+            _std_svc_row(name, svc_id, svc_lbl, svc_note)
+            for svc_id, svc_lbl, svc_note in workloads.get("active", [])
+        )
+        background_rows = "".join(
+            _std_svc_row(name, svc_id, svc_lbl, svc_note)
+            for svc_id, svc_lbl, svc_note in workloads.get("background", [])
+        )
+        scheduled_rows = "".join(
+            _std_svc_row(name, svc_id, svc_lbl, svc_note)
+            for svc_id, svc_lbl, svc_note in workloads.get("scheduled", [])
+        )
+        svc_html = (
+            _std_work_section("Active work", active_rows)
+            + _std_work_section("Queue", queue_rows)
+            + _std_work_section("Scheduled tasks", scheduled_rows)
+            + _std_work_section("Background services", background_rows)
+            + _std_work_section("Completed", completed_rows)
+        )
+
+        cards.append(
+            f'<div class="card">'
+            f'<div class="card-header">'
+            f'<span class="vm-name">{html.escape(name)}</span>{badge}'
+            f'</div>'
+            + (f'<p class="notes">{notes}</p>' if notes else "")
+            + f'<p><b>Role:</b> {role_label}</p>'
+            f'<p><b>Shape:</b> {shape}</p>'
+            f'<p><b>Uptime:</b> {uptime}</p>'
+            f'<p><b>Public IP:</b> {public_ip}</p>'
+            f'<p><b>Private IP:</b> {private_ip}</p>'
+            f'<p><b>OCI snapshot:</b> {html.escape(snap_ago)}</p>'
+            + (_std_mgmt_tls_html() if name == 'management' else '')
+            + (f'<p><b>Heartbeat:</b> {hb_ago}</p>' if hb_ago else "")
+            + f'<div class="card-actions">{"".join(actions)}</div>'
+            + svc_html
+            + '</div>'
+        )
+    return "\n".join(cards)
+
+
+
+
+# ── fleet page ────────────────────────────────────────────────────────────────
+
+def std_fleet_page() -> bytes:
+    cards  = _std_vm_cards()
+    events = fleet_events_html()
+    page = (
+        _std_head(FLEET_NAME, auto_refresh=60)
+        + _std_topbar("fleet")
+        + '<div class="content">'
+        + f'<div class="grid">{cards}</div>'
+        + '<p class="section-title">Oracle Free Tier Quota</p>'
+        + f'<div class="quota-section">{_quota_html()}</div>'
+        + '<p class="section-title">Recent Fleet Events</p>'
+        + f'<div>{events}</div>'
+        + '<p style="margin:24px 0 0;font-size:13px;color:var(--c-muted);text-align:center">'
+        + '<a href="/tools">Tools</a> &nbsp;&middot;&nbsp; <a href="/queue">Queue</a> &nbsp;&middot;&nbsp; '
+        + '<a href="/audit">Audit log</a>'
+        + '</p>'
+        + '<footer>Auto-refreshes every 60s &middot; management VM</footer>'
+        + '</div></body></html>'
+    )
+    return page.encode("utf-8")
+
+
+def std_stats_page(vm_name: str, fleet_vms: list) -> bytes:
+    title  = f"{FLEET_NAME} — {vm_name} stats"
+    raw    = collect_local_stats() if vm_name == "management" else collect_remote_stats(vm_name)
+    output = html.escape(raw)
+    now    = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    vm_links = " ".join(
+        f'<a href="/stats?vm={html.escape(v)}" {_ACT if v == vm_name else ""}>{html.escape(v)}</a>'
+        for v in fleet_vms
+    )
+    page = (
+        _std_head(title)
+        + _std_topbar("stats")
+        + f'<div class="content">'
+        + f'<div class="vmbar">{vm_links}</div>'
+        + f'<p class="meta">Snapshot taken {now}</p>'
+        + f'<pre>{output}</pre>'
+        + '<div style="display:flex;gap:12px;align-items:center;margin-top:12px">'
+        + f'<a class="btn" href="/stats?vm={html.escape(vm_name)}">Refresh</a>'
+        + '<label><input type="checkbox" onchange="(function(cb){'
+        + 'if(cb.checked){window._ar=setInterval(()=>location.reload(),10000)}'
+        + 'else{clearInterval(window._ar)}})(this)"> Auto-refresh 10s</label>'
+        + '</div>'
+        + f'<p class="section-title">Scheduled Tasks (crontab)</p>'
+        + f'<pre>{html.escape(_read_vm_crontab(vm_name))}</pre>'
+        + '</div></body></html>'
+    )
+    return page.encode("utf-8")
+
+
+# ── logs page ─────────────────────────────────────────────────────────────────
+
+def std_logs_page(vm_name: str, service_name: str, fleet_vms: list) -> bytes:
+    title  = f"{FLEET_NAME} — {vm_name} logs"
+    raw    = (collect_local_logs(service_name) if vm_name == "management"
+              else collect_remote_logs(vm_name, service_name))
+    output = html.escape(raw)
+    now    = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    vm_links = " ".join(
+        f'<a href="/logs?vm={html.escape(v)}&service={html.escape(service_name)}" '
+        f'{_ACT if v == vm_name else ""}>{html.escape(v)}</a>'
+        for v in fleet_vms
+    )
+    svc_links = " ".join(
+        f'<a href="/logs?vm={html.escape(vm_name)}&service={html.escape(svc)}" '
+        f'{_ACT if svc == service_name else ""}>{html.escape(label)}</a>'
+        for svc, label in _LOG_SERVICES
+    )
+    page = (
+        _std_head(title)
+        + _std_topbar("logs")
+        + f'<div class="content">'
+        + f'<div class="vmbar">{vm_links}</div>'
+        + f'<div class="svcbar">{svc_links}</div>'
+        + f'<p class="meta">Fetched {now}</p>'
+        + f'<pre>{output}</pre>'
+        + '<div style="display:flex;gap:12px;align-items:center;margin-top:12px">'
+        + f'<a class="btn" href="/logs?vm={html.escape(vm_name)}&service={html.escape(service_name)}">Refresh</a>'
+        + '<label><input type="checkbox" onchange="(function(cb){'
+        + 'if(cb.checked){window._ar=setInterval(()=>location.reload(),15000)}'
+        + 'else{clearInterval(window._ar)}})(this)"> Auto-refresh 15s</label>'
+        + '</div></div></body></html>'
+    )
+    return page.encode("utf-8")
+
+
+# ── login page ────────────────────────────────────────────────────────────────
+
+def std_login_page(error: bool = False, locked: bool = False) -> bytes:
+    if locked:
+        err = '<p class="error-msg">Too many failed attempts. Try again in 15 minutes.</p>'
+    elif error:
+        err = '<p class="error-msg">Incorrect username or password.</p>'
+    else:
+        err = ""
+    page = (
+        _std_head(FLEET_NAME)
+        + f'<div class="login-wrap"><div class="login-box">'
+        + f'<img id="login-logo" class="login-logo" alt="Fleet Logo">'
+        + f'<h1>{html.escape(FLEET_NAME)}</h1>'
+        + '<p class="sub">Admin Dashboard</p>'
+        + f'{err}'
+        + '<form method="POST" action="/login">'
+        + '<label for="u">Username</label>'
+        + '<input id="u" type="text" name="username" autocomplete="username" autofocus>'
+        + '<label for="p">Password</label>'
+        + '<input id="p" type="password" name="password" autocomplete="current-password">'
+        + '<button type="submit">Sign in</button>'
+        + '</form></div></div></body></html>'
+    )
+    return page.encode("utf-8")
+
+
+# ── export page ───────────────────────────────────────────────────────────────
+
+def std_export_page() -> bytes:
+    fleet = load_json(TOOLS_DIR / "fleet.json") or {"vms": []}
+    env   = _mgmt_env()
+    lines = [
+        f"# {FLEET_NAME} — Fleet Connection Details",
+        f"# Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+        "",
+    ]
+    for vm in fleet.get("vms", []):
+        name    = vm.get("name", "")
+        profile = load_json(PROFILE_DIR / f"{name}.json") or {}
+        pub     = profile.get("public_ip", "")
+        priv    = profile.get("private_ip", "")
+        lines += [
+            f"# {name.upper()}",
+            f"OCI_{name.upper()}_HOST={pub}",
+            f"OCI_{name.upper()}_PRIVATE_IP={priv}",
+            "",
+        ]
+    ssh_key = env.get("OCI_SSH_PRIVATE_KEY_PATH", "~/.ssh/fleet.key")
+    ssh_user = env.get("OCI_SSH_USER", "ubuntu")
+    lines += [
+        "# SSH",
+        f"OCI_SSH_USER={ssh_user}",
+        f"OCI_SSH_PRIVATE_KEY_PATH={ssh_key}",
+        f"# SSH example: {ssh_key} {ssh_user}@<public-ip>",
+    ]
+    content = html.escape("\n".join(lines))
+    page = (
+        _std_head(f"{FLEET_NAME} — Export")
+        + _std_topbar("export")
+        + f'<div class="content">'
+        + f'<h2 style="margin:0 0 16px">Fleet connection details</h2>'
+        + f'<pre class="export-pre">{content}</pre>'
+        + '</div></body></html>'
+    )
+    return page.encode("utf-8")
+
+
+# ── tools page ───────────────────────────────────────────────────────────────
+
+
+def std_tools_page(preselect_vm: str = "") -> bytes:
+    title     = f"{FLEET_NAME} — Tools"
+    fleet     = load_json(TOOLS_DIR / "fleet.json") or {"vms": []}
+    vms       = [v.get("name") for v in fleet.get("vms", []) if v.get("name")]
+    if not vms:
+        vms = ["management"]
+    preselect = preselect_vm if preselect_vm in vms else vms[0]
+
+    vm_options = "".join(
+        f'<option value="{html.escape(v)}"{" selected" if v == preselect else ""}>{html.escape(v)}</option>'
+        for v in vms
+    )
+
+    # Build preset cards — onclick references a JS object keyed by slug.
+    # Scripts are stored in JS (not in HTML attributes) to avoid > < " escaping issues.
+    preset_cards = "".join(
+        f'<div class="payload-card" id="preset-{html.escape(slug)}"'
+        f' data-slug="{html.escape(slug)}" onclick="selectPreset(this.dataset.slug)">'
+        f'<p class="payload-title">{html.escape(label)}</p>'
+        f'<p class="payload-desc">{html.escape(desc)}</p>'
+        f'</div>'
+        for slug, label, desc, _script in _PAYLOAD_PRESETS
+    )
+
+    # Serialize scripts as a JS object — json.dumps handles all escaping.
+    scripts_js = "{" + ",".join(
+        f'{json.dumps(slug)}:{json.dumps(script)}'
+        for slug, _label, _desc, script in _PAYLOAD_PRESETS
+    ) + "}"
+
+    page = (
+        _std_head(title)
+        + _std_topbar("tools")
+        + '<div class="content">'
+        + '<h2 style="margin:0 0 4px">Admin Tools</h2>'
+        + '<p style="color:var(--c-muted);font-size:14px;margin:0 0 4px">'
+        + 'Click a preset to load its script. Select a target VM, then click Run. '
+        + 'The script runs via SSH as bash on remote VMs, or locally on management.</p>'
+        + '<h3 style="font-size:13px;font-weight:700;margin:16px 0 8px;color:var(--c-muted);text-transform:uppercase;letter-spacing:.5px">Presets</h3>'
+        + '<div class="tools-grid">' + preset_cards
+        + '<div class="payload-card" id="preset-custom" data-slug="custom" onclick="selectPreset(this.dataset.slug)">'
+        + '<p class="payload-title">Custom script</p>'
+        + '<p class="payload-desc">Write or paste your own bash script below.</p>'
+        + '</div></div>'
+        + '<h3 style="font-size:13px;font-weight:700;margin:20px 0 8px;color:var(--c-muted);text-transform:uppercase;letter-spacing:.5px">Script</h3>'
+        + '<textarea id="payload-editor" class="script-editor"'
+        + ' placeholder="#!/bin/bash&#10;# Click a preset above, or write your own script here.&#10;# Runs via SSH on the VM selected below."></textarea>'
+        + '<div class="run-bar">'
+        + '<select id="payload-vm" class="vm-select">' + vm_options + '</select>'
+        + '<button class="btn" id="run-btn" onclick="runPayload()">&#9654; Run on VM</button>'
+        + '<span id="payload-status" style="font-size:13px;color:var(--c-muted)"></span>'
+        + '</div>'
+        + '<div id="payload-header" style="display:none;justify-content:space-between;align-items:center;margin-top:16px;margin-bottom:4px">'
+        + '<span style="font-size:11px;font-weight:700;color:var(--c-muted);text-transform:uppercase;letter-spacing:.5px">Output</span>'
+        + '<button id="copy-btn" onclick="copyOutput()" style="font-size:12px;padding:3px 10px;'
+        + 'border:1px solid var(--c-border);border-radius:4px;background:var(--c-bg);'
+        + 'color:var(--c-text);cursor:pointer">&#x2398; Copy</button>'
+        + '</div>'
+        + '<pre id="payload-output" style="margin-top:0;display:none"></pre>'
+        + "<script>"
+        + f"var SCRIPTS={scripts_js};"
+        + "function selectPreset(slug){"
+        + "  document.querySelectorAll('.payload-card').forEach(function(c){c.classList.remove('selected');});"
+        + "  var card=document.getElementById('preset-'+slug);"
+        + "  if(card)card.classList.add('selected');"
+        + "  var ed=document.getElementById('payload-editor');"
+        + "  if(slug==='custom'){ed.value='';ed.focus();}"
+        + "  else if(SCRIPTS[slug]){ed.value=SCRIPTS[slug];}"
+        + "}"
+        + "function runPayload(){"
+        + "  var script=document.getElementById('payload-editor').value.trim();"
+        + "  var vm=document.getElementById('payload-vm').value;"
+        + "  var status=document.getElementById('payload-status');"
+        + "  var btn=document.getElementById('run-btn');"
+        + "  if(!script){status.textContent='Select a preset or write a script first.';return;}"
+        + "  btn.disabled=true;btn.textContent='Running…';"
+        + "  status.textContent='Running on '+vm+'…';"
+        + "  var out=document.getElementById('payload-output');"
+        + "  out.style.display='none';"
+        + "  fetch('/run-payload',{method:'POST',"
+        + "    headers:{'Content-Type':'application/json'},"
+        + "    body:JSON.stringify({vm:vm,script:script})})"
+        + "  .then(function(r){return r.json();})"
+        + "  .then(function(d){"
+        + "    btn.disabled=false;btn.textContent='▶ Run on VM';"
+        + "    status.textContent=d.exit_code===0?'✓ Done on '+vm:'✗ Exit '+d.exit_code+' on '+vm;"
+        + "    out.textContent=d.output||'(no output)';out.style.display='block';"
+        + "    document.getElementById('payload-header').style.display='flex';})"
+        + "  .catch(function(e){"
+        + "    btn.disabled=false;btn.textContent='▶ Run on VM';"
+        + "    status.textContent='Request failed: '+e.message;"
+        + "    out.textContent=String(e);out.style.display='block';"
+        + "    document.getElementById('payload-header').style.display='flex';});}"
+        + "function copyOutput(){"
+        + "  navigator.clipboard.writeText(document.getElementById('payload-output').textContent)"
+        + "  .then(function(){"
+        + "    var b=document.getElementById('copy-btn');b.textContent='✓ Copied';"
+        + "    setTimeout(function(){b.textContent='⎘ Copy';},1500);});}"
+        + "</script>"
+        + '</div></body></html>'
+    )
+    return page.encode("utf-8")
+
+
+# ── queue page ────────────────────────────────────────────────────────────────
+
+def std_queue_page(fleet_vms: list) -> bytes:
+    title = f"{FLEET_NAME} — Job Queue"
+    sections = []
+    for vm in fleet_vms:
+        jobs = _read_vm_queue(vm)
+        if not jobs:
+            rows_html = '<p class="muted">No jobs.</p>'
+        else:
+            rows = []
+            for j in jobs:
+                st  = j.get("status", "?")
+                out = html.escape((j.get("output") or "")[:300])
+                rows.append(
+                    f'<tr>'
+                    f'<td><span class="badge badge-{html.escape(st)}">{html.escape(st)}</span></td>'
+                    f'<td>{html.escape(j.get("label","?"))}</td>'
+                    f'<td class="muted">{html.escape(str(j.get("priority","?")))}</td>'
+                    f'<td class="muted">{html.escape(j.get("queued_at","")[:16])}</td>'
+                    f'<td class="muted">{html.escape(j.get("completed_at","")[:16])}</td>'
+                    f'<td><div class="q-output">{out}</div></td>'
+                    f'</tr>'
+                )
+            rows_html = (
+                '<table class="q-table"><thead><tr>'
+                '<th>Status</th><th>Label</th><th>Pri</th>'
+                '<th>Queued</th><th>Done</th><th>Output</th>'
+                '</tr></thead><tbody>' + "".join(rows) + '</tbody></table>'
+            )
+        sections.append(f'<p class="section-title">{html.escape(vm)}</p>' + rows_html)
+    page = (
+        _std_head(title)
+        + _std_topbar("queue")
+        + '<div class="content">'
+        + '<p style="font-size:13px;color:var(--c-muted);margin:0 0 16px">'
+        + 'On-demand job queue &#8212; tasks submitted via this console or the <code>/enqueue</code> API. '
+        + '&#8220;No jobs&#8221; is normal on a fresh deployment until a job is submitted. '
+        + 'Background systemd services are not shown here &#8212; '
+        + 'those appear as service chips on the <a href="/">Fleet</a> page.'
+        + '</p>'
+        + "".join(sections)
+        + '</div></body></html>'
+    )
+    return page.encode("utf-8")
+
+
+# ── audit log page ─────────────────────────────────────────────────────────────
+
+def std_audit_page() -> bytes:
+    title   = f"{FLEET_NAME} — Audit Log"
+    entries: list[dict] = []
+    if AUDIT_LOG.exists():
+        try:
+            lines = AUDIT_LOG.read_text(encoding="utf-8").strip().splitlines()
+            for line in lines[-200:]:
+                try: entries.append(json.loads(line))
+                except Exception: pass
+        except Exception:
+            pass
+    entries.reverse()
+    if not entries:
+        body = '<p class="muted">No audit entries yet.</p>'
+    else:
+        rows = []
+        for e in entries:
+            rows.append(
+                f'<div class="audit-row">'
+                f'<span class="audit-ts">{html.escape(e.get("ts","")[:16])}</span>'
+                f'<span class="audit-who">{html.escape(e.get("ip","?"))}</span>'
+                f'<span class="audit-act">{html.escape(e.get("action","?"))}</span>'
+                f'<span class="audit-vm">{html.escape(e.get("vm","—"))}</span>'
+                f'<span class="audit-det">{html.escape(e.get("details",""))}</span>'
+                f'</div>'
+            )
+        body = "".join(rows)
+    page = (
+        _std_head(title)
+        + _std_topbar("audit")
+        + '<div class="content">'
+        + '<p style="font-size:13px;color:var(--c-muted);margin:0 0 16px">'
+        + 'Audit log &#8212; admin actions recorded by this console: script runs, service control, job submissions. '
+        + 'Written to <code>~/cloud-lab/logs/audit.jsonl</code> on the management VM. '
+        + 'Last 200 entries shown, newest first.'
+        + '</p>' + body + '</div></body></html>'
+    )
+    return page.encode("utf-8")
+
+
+
+# ── console JS ────────────────────────────────────────────────────────────────
+# All styling comes from the vendored LCARS framework (TheLCARS.com Classic
+# Theme) plus console.css supplements, both served from /static/lcars/.
+
+CONSOLE_JS = """
+function updateStardate() {
+  var n = new Date();
+  var y = n.getFullYear() - 1946;
+  var start = new Date(n.getFullYear(), 0, 1);
+  var day = Math.ceil((n - start) / 864e5);
+  var el = document.getElementById('Stardate');
+  if (el) el.textContent = y + String(Math.floor(day * 2.732)).padStart(3, '0') + '.' + n.getHours();
+}
+updateStardate();
+setInterval(updateStardate, 60000);
+
+async function svcCtl(vm, svc, action) {
+  if (!confirm(action + " " + svc + " on " + vm + "?")) return;
+  var r;
+  try {
+    r = await fetch("/service-control", {method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({vm: vm, service: svc, action: action})});
+  } catch(e) { alert("Request failed: " + e); return; }
+  var d = await r.json();
+  alert((d.output || d.error || "Done").trim());
+}
+
+function copyText(text, btn) {
+  navigator.clipboard.writeText(text).then(function() {
+    var orig = btn.textContent;
+    btn.textContent = 'COPIED';
+    setTimeout(function() { btn.textContent = orig; }, 1500);
+  }).catch(function() { prompt('Copy:', text); });
+}
+
+function applyBeepVolume() {
+  var off = localStorage.getItem('lcars-beeps') === '0';
+  document.querySelectorAll('audio').forEach(function(a) { a.volume = off ? 0 : 1; });
+}
+document.addEventListener('DOMContentLoaded', applyBeepVolume);
+"""
+
 
 _LOG_SERVICES = [
     ("cloud-lab-a1-lottery",   "Lottery"),
@@ -1199,100 +1954,165 @@ _PAYLOAD_PRESETS: list[tuple[str, str, str, str]] = [
 ]
 
 
-# ── shared HTML helpers ───────────────────────────────────────────────────────
+# ── LCARS chassis ─────────────────────────────────────────────────────────────
+# Markup follows TheLCARS.com Classic Theme (V26). The framework CSS, Antonio
+# fonts and beep audio are vendored under static/lcars/thelcars/; console.css
+# adds the console-specific components (cards, tables, forms, readouts).
 
-def _head(title: str, auto_refresh: int = 0) -> str:
+_LC = "/static/lcars/thelcars"
+
+_NAV_ITEMS = [
+    ("01", "FLEET", "/",      "fleet"),
+    ("02", "STATS", "/stats", "stats"),
+    ("03", "LOGS",  "/logs",  "logs"),
+    ("04", "TOOLS", "/tools", "tools"),
+]
+
+_SIDE_PANELS = [
+    ("panel-3", "05", "QUEUE",  "/queue"),
+    ("panel-4", "06", "AUDIT",  "/audit"),
+    ("panel-5", "07", "EXPORT", "/export"),
+    ("panel-6", "08", "EXIT",   "/logout"),
+]
+
+
+def _lcars_head(title: str, auto_refresh: int = 0) -> str:
     refresh = f'<meta http-equiv="refresh" content="{auto_refresh}">' if auto_refresh else ""
+    scale = getattr(_ui_ctx, "scale", 1.0)
+    style = f' style="--ui-scale:{scale:g}"' if scale != 1.0 else ""
     return (
-        f'<!doctype html><html lang="en"><head>'
-        f'<meta charset="utf-8">'
-        f'<meta name="viewport" content="width=device-width,initial-scale=1">'
+        f'<!doctype html><html lang="en"{style}><head>'
+        '<meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">'
         f'{refresh}'
         f'<title>{html.escape(title)}</title>'
-        f'<style>{COMMON_CSS}</style>'
-        f'<script>{THEME_JS}</script>'
-        f'</head><body>'
+        f'<link rel="stylesheet" href="{_LC}/lcars-classic.css?v={STATIC_ASSET_VERSION}">'
+        f'<link rel="stylesheet" href="/static/lcars/console.css?v={STATIC_ASSET_VERSION}">'
+        '</head><body>'
     )
 
 
-_PAGE_SUBTITLES: dict[str, str] = {
-    "fleet":  "Fleet Management",
-    "stats":  "VM Stats",
-    "logs":   "Log Stream",
-    "export": "Export",
-}
+def _lcars_data_cascade() -> str:
+    """Animated numeric cascade for the header — pure LCARS set dressing."""
+    cols = []
+    for _ in range(16):
+        rows = "".join(
+            f'<div class="dc-row-{r}">{random.randint(0, 10 ** random.randint(2, 7))}</div>'
+            for r in (1, 1, 2, 3, 3, 4, 5, 6, 7)
+        )
+        cols.append(f'<div class="data-column">{rows}</div>')
+    return '<div class="data-cascade-wrapper" id="default">' + "".join(cols) + '</div>'
 
 
-def _topbar(active: str = "") -> str:
-    nav_items = [
-        ("Fleet",  "/",       "fleet"),
-        ("Stats",  "/stats",  "stats"),
-        ("Logs",   "/logs",   "logs"),
-        ("Export", "/export", "export"),
-    ]
-    links = " ".join(
-        f'<a href="{href}" {_ACT if active == key else ""}>{label}</a>'
-        for label, href, key in nav_items
+def _page(active: str, banner: str, content: str, *,
+          auto_refresh: int = 0, page_js: str = "") -> bytes:
+    """Wrap page content in the full LCARS chassis and return encoded HTML."""
+    layout = getattr(_ui_ctx, "layout", "t")
+    nav_parts = []
+    for num, label, href, key in _NAV_ITEMS:
+        cur = ' class="nav-current"' if key == active else ""
+        nav_parts.append(
+            f'<button{cur} onclick="playSoundAndRedirect(\'audio2\',\'{href}\')">{num}-{label}</button>'
+        )
+    nav = "".join(nav_parts)
+    side = "".join(
+        f'<button class="{cls}" onclick="playSoundAndRedirect(\'audio2\',\'{href}\')">'
+        f'<span class="hop">{num}-</span>{label}</button>'
+        for cls, num, label, href in _SIDE_PANELS
     )
-    preset_btns = " ".join(
-        f'<button class="palette-btn"'
-        f' style="background:{btn_bg}"'
-        f' data-vars=\'{json.dumps(pvars)}\''
-        f' data-theme="{theme}"'
-        f' onclick="applyPalette(this)">{name}</button>'
-        for name, btn_bg, theme, pvars in PALETTE_PRESETS
-    )
-    # Custom button: diagonal split of two grays to suggest "make your own"
-    custom_btn = (
-        '<button class="palette-btn"'
-        ' style="background:linear-gradient(135deg,#4b5563 55%,#9ca3af 45%)"'
-        ' onclick="toggleCustomPanel()">Custom</button>'
-    )
-    custom_panel = (
-        '<div id="custom-panel" class="custom-panel" hidden>'
-        '<h3>Pick colors</h3>'
-        '<label>Primary <input type="color" id="cp-primary" value="#374151"></label>'
-        '<label>Primary (light) <input type="color" id="cp-primary-lt" value="#4b5563"></label>'
-        '<label>Primary (dark) <input type="color" id="cp-primary-dk" value="#1f2937"></label>'
-        '<label>Accent <input type="color" id="cp-accent" value="#f59e0b"></label>'
-        '<h3 style="margin-top:10px">Logo</h3>'
-        '<input type="url" id="cp-logo" placeholder="https://... or data:image/...">'
-        '<p class="custom-hint">'
-        'PNG or SVG &middot; transparent background &middot; ~44 px tall<br>'
-        'To embed locally: <code>base64 -w0 logo.png</code> then prefix with<br>'
-        '<code>data:image/png;base64,</code>'
-        '</p>'
-        '<button class="btn" onclick="applyCustomPalette()" style="width:100%;padding:7px;margin-top:4px">Apply</button>'
+    fleet_h = html.escape(FLEET_NAME.upper())
+    page = (
+        _lcars_head(f"{FLEET_NAME} — {banner}", auto_refresh=auto_refresh)
+        + '<section class="wrap-standard" id="column-3">'
+        '<div class="wrap">'
+        '<div class="left-frame-top">'
+        f'<button onclick="playSoundAndRedirect(\'audio2\',\'/\')" class="panel-1-button">{fleet_h}</button>'
+        '<button onclick="playSoundAndRedirect(\'audio2\',\'/\')" class="panel-2">02<span class="hop">-262000</span></button>'
+        '</div>'
+        '<div class="right-frame-top">'
+        f'<div class="banner">{html.escape(banner)} &#149; <span id="Stardate"></span></div>'
+        '<div class="data-cascade-button-group">'
+        f'{_lcars_data_cascade()}'
+        f'<nav>{nav}</nav>'
+        '</div>'
+        '<div class="bar-panel first-bar-panel">'
+        '<div class="bar-1"></div><div class="bar-2"></div><div class="bar-3"></div>'
+        '<div class="bar-4"></div><div class="bar-5"></div>'
+        '</div>'
+        '</div>'
+        '</div>'
+        '<div class="wrap" id="gap">'
+        '<div class="left-frame">'
+        '<button onclick="topFunction(); playSound()" id="topBtn"><span class="hop">screen</span> top</button>'
+        f'<div>{side}<div class="panel-spacer"></div></div>'
+        '<div><button class="panel-7" onclick="playSoundAndRedirect(\'audio2\',\'/settings\')">'
+        '<span class="hop">09-</span>SETUP</button></div>'
+        '</div>'
+        '<div class="right-frame">'
+        '<div class="bar-panel">'
+        '<div class="bar-6"></div><div class="bar-7"></div><div class="bar-8"></div>'
+        '<div class="bar-9"></div><div class="bar-10"></div>'
+        '</div>'
+        f'<main>{content}</main>'
+        '<footer>'
+        f'{fleet_h} admin console &middot; runs on the management VM<br>'
+        'LCARS Inspired Website Template by <a href="https://www.thelcars.com">TheLCARS.com</a><br>'
+        'STAR TREK &#174; and related marks are trademarks of CBS Studios Inc. '
+        'This private console is not affiliated with CBS Studios Inc. '
+        'LCARS was designed by Michael Okuda.'
+        '</footer>'
+        f'<script src="{_LC}/lcars.js?v={STATIC_ASSET_VERSION}"></script>'
+        f'<script>{CONSOLE_JS}{page_js}</script>'
+        '<div class="headtrim"></div>'
+        '<div class="baseboard"></div>'
+        f'<audio id="audio1" src="{_LC}/beep1.mp3" preload="auto"></audio>'
+        f'<audio id="audio2" src="{_LC}/beep2.mp3" preload="auto"></audio>'
+        f'<audio id="audio3" src="{_LC}/beep3.mp3" preload="auto"></audio>'
+        f'<audio id="audio4" src="{_LC}/beep4.mp3" preload="auto"></audio>'
+        '</div>'
         '</div>'
     )
+    if layout == "c":
+        # Full-frame "C" — close the bottom of the frame with a mirrored elbow band.
+        page += (
+            '<div class="wrap">'
+            '<div class="frame-close-left">L4-7</div>'
+            '<div class="frame-close-right">'
+            '<div class="bar-panel">'
+            '<div class="bar-6"></div><div class="bar-7"></div><div class="bar-8"></div>'
+            '<div class="bar-9"></div><div class="bar-10"></div>'
+            '</div>'
+            '</div>'
+            '</div>'
+        )
+    page += '</section></body></html>'
+    return page.encode("utf-8")
+
+
+def _lcars_pill(href: str, label: str, current: bool = False) -> str:
+    cur = ' class="current"' if current else ""
+    return f'<a{cur} href="{href}">{html.escape(label)}</a>'
+
+
+def _lcars_text_bar(heading: str, level: str = "h3", the_end: bool = False) -> str:
+    end = " the-end" if the_end else ""
     return (
-        f'<div class="topbar">'
-        f'<div class="topbar-left">'
-        f'<a href="/" style="display:flex;align-items:center;gap:10px;text-decoration:none">'
-        f'<img id="topbar-logo" class="topbar-logo visible" src="{_DEFAULT_LOGO}" alt="Fleet Logo">'
-        f'<span class="fleet-name">{html.escape(_PAGE_SUBTITLES.get(active, FLEET_NAME))}</span>'
-        f'</a>'
-        f'</div>'
-        f'<nav class="topbar-nav">{links}'
-        f'<button class="theme-btn" title="Appearance" onclick="toggleSettings()">&#9881;</button>'
-        f'<a href="/logout" class="sign-out">Sign out</a>'
-        f'</nav></div>'
-        f'<div id="settings-panel" class="settings-panel" hidden>'
-        f'<div class="settings-row">'
-        f'<span>Dark mode</span>'
-        f'<button class="theme-btn" onclick="toggleTheme()" style="margin-left:auto">'
-        f'<span id="theme-icon">&#127769;</span></button>'
-        f'</div>'
-        f'<h3>Color palette</h3>'
-        f'<div class="palette-grid">{preset_btns}{custom_btn}</div>'
-        f'{custom_panel}'
+        f'<div class="lcars-text-bar{end}">'
+        f'<{level}>{html.escape(heading)}</{level}>'
         f'</div>'
     )
 
 
 # ── VM cards ──────────────────────────────────────────────────────────────────
 
-def vm_cards() -> str:
+_ROLE_CARD_CLASSES = {
+    "management": "role-management",
+    "worker":     "role-worker",
+    "laboratory": "role-laboratory",
+}
+
+
+def _lcars_vm_cards() -> str:
     refresh_oci_snapshots()
     fleet = load_json(TOOLS_DIR / "fleet.json") or {"vms": []}
     with _hb_lock:
@@ -1306,15 +2126,14 @@ def vm_cards() -> str:
         profile    = load_json(PROFILE_DIR / f"{name}.json") or {}
         instance   = profile.get("instance", {})
         state      = instance.get("lifecycle-state", "UNKNOWN")
-        shape      = html.escape(instance.get("shape") or vm.get("shape", ""))
-        public_ip  = html.escape(profile.get("public_ip") or "—")
-        private_ip = html.escape(profile.get("private_ip") or "—")
+        shape      = instance.get("shape") or vm.get("shape", "")
+        public_ip  = profile.get("public_ip") or "—"
+        private_ip = profile.get("private_ip") or "—"
         role       = vm.get("role", name)
-        role_label = html.escape(role)
-        notes      = html.escape(vm.get("notes", ""))
+        notes      = vm.get("notes", "")
         synced_at  = profile.get("synced_at", "")
 
-        hb = hbs.get(name, {})
+        hb       = hbs.get(name, {})
         hb_time  = hb.get("received_at", "")
         snap_ago = fmt_ago(synced_at) if synced_at else "never"
 
@@ -1329,170 +2148,197 @@ def vm_cards() -> str:
                 uptime = f"{d}d {h}h {m}m" if d else f"{h}h {m}m"
             except Exception:
                 uptime = "—"
-            hb_ago = ""   # management doesn't heartbeat to itself
+            hb_html = ""
         else:
-            uptime = html.escape(hb.get("uptime", "") or "—")
-            hb_ago = fmt_ago(hb_time) if hb_time else '<span class="warn-text">not received yet</span>'
+            uptime = hb.get("uptime", "") or "—"
+            hb_val = (html.escape(fmt_ago(hb_time)) if hb_time
+                      else '<span class="warn-text">not received yet</span>')
+            hb_html = f'<div class="vm-field"><b>Heartbeat</b><span>{hb_val}</span></div>'
 
-        state_cls = state.lower().replace(" ", "-")
-        badge = f'<span class="badge {state_cls}">{html.escape(state)}</span>'
+        fields = "".join(
+            f'<div class="vm-field"><b>{html.escape(k)}</b><span>{html.escape(str(v))}</span></div>'
+            for k, v in [
+                ("Role", role), ("Shape", shape), ("Uptime", uptime),
+                ("Public IP", public_ip), ("Private IP", private_ip),
+                ("OCI snapshot", snap_ago),
+            ]
+        )
+        fields += _lcars_mgmt_tls_html() if name == "management" else ""
+        fields += hb_html
 
         ssh_cmd = f"ssh -i ~/.ssh/fleet.key {ssh_user}@{public_ip}"
-
         actions = [
-            f'<a class="act-btn" href="/stats?vm={html.escape(name)}">Live stats</a>',
-            f'<a class="act-btn" href="/logs?vm={html.escape(name)}">Logs</a>',
+            f'<a class="button-bluey" href="/stats?vm={html.escape(name)}">Live stats</a>',
+            f'<a class="button-lilac" href="/logs?vm={html.escape(name)}">Logs</a>',
+            f'<a class="button-almond" href="/tools?vm={html.escape(name)}">Tools</a>',
         ]
         if public_ip != "—":
             actions.append(
-                f'<button class="act-btn" onclick="copyText({json.dumps(ssh_cmd)},this)">Copy SSH</button>'
+                f'<button class="button-sky" onclick="copyText({json.dumps(ssh_cmd)},this)">Copy SSH</button>'
             )
-        actions.append(f'<a class="act-btn" href="/tools?vm={html.escape(name)}">Tools</a>')
         if name == "worker":
             actions.append(
-                '<a class="act-btn accent" href="/logs?vm=worker&service=cloud-lab-a1-lottery">Lottery logs</a>'
+                '<a class="button-golden-orange" href="/logs?vm=worker&service=cloud-lab-a1-lottery">Lottery logs</a>'
             )
 
         workloads = _ROLE_WORKLOADS.get(role, {})
-        queued_active, queue_rows, completed_rows = _queue_sections(name)
+        queued_active, queue_rows, completed_rows = _queue_sections(name, _lcars_plain_work_row)
         active_rows = queued_active + "".join(
-            _svc_row(name, svc_id, svc_lbl, svc_note)
+            _lcars_svc_row(name, svc_id, svc_lbl, svc_note)
             for svc_id, svc_lbl, svc_note in workloads.get("active", [])
         )
         background_rows = "".join(
-            _svc_row(name, svc_id, svc_lbl, svc_note)
+            _lcars_svc_row(name, svc_id, svc_lbl, svc_note)
             for svc_id, svc_lbl, svc_note in workloads.get("background", [])
         )
         scheduled_rows = "".join(
-            _svc_row(name, svc_id, svc_lbl, svc_note)
+            _lcars_svc_row(name, svc_id, svc_lbl, svc_note)
             for svc_id, svc_lbl, svc_note in workloads.get("scheduled", [])
         )
-        svc_html = (
-            _work_section("Active work", active_rows)
-            + _work_section("Queue", queue_rows)
-            + _work_section("Scheduled tasks", scheduled_rows)
-            + _work_section("Background services", background_rows)
-            + _work_section("Completed", completed_rows)
+        sections = (
+            _lcars_work_section("Active work", active_rows)
+            + _lcars_work_section("Queue", queue_rows)
+            + _lcars_work_section("Scheduled tasks", scheduled_rows)
+            + _lcars_work_section("Background services", background_rows)
+            + _lcars_work_section("Completed", completed_rows)
         )
 
+        role_cls = _ROLE_CARD_CLASSES.get(role, "role-default")
         cards.append(
-            f'<div class="card">'
-            f'<div class="card-header">'
-            f'<span class="vm-name">{html.escape(name)}</span>{badge}'
-            f'</div>'
-            + (f'<p class="notes">{notes}</p>' if notes else "")
-            + f'<p><b>Role:</b> {role_label}</p>'
-            f'<p><b>Shape:</b> {shape}</p>'
-            f'<p><b>Uptime:</b> {uptime}</p>'
-            f'<p><b>Public IP:</b> {public_ip}</p>'
-            f'<p><b>Private IP:</b> {private_ip}</p>'
-            f'<p><b>OCI snapshot:</b> {html.escape(snap_ago)}</p>'
-            + (_mgmt_tls_html() if name == 'management' else '')
-            + (f'<p><b>Heartbeat:</b> {hb_ago}</p>' if hb_ago else "")
-            + f'<div class="card-actions">{"".join(actions)}</div>'
-            + svc_html
-            + '</div>'
+            '<div class="vm-card">'
+            f'<div class="vm-card-head {role_cls}">'
+            f'<span class="vm-state">{html.escape(state)}</span>'
+            f'<strong>{html.escape(name)}</strong>'
+            '</div>'
+            + (f'<p class="vm-notes">{html.escape(notes)}</p>' if notes else "")
+            + f'<div class="vm-fields">{fields}</div>'
+            f'<div class="btn-row">{"".join(actions)}</div>'
+            f'{sections}'
+            '</div>'
         )
-    return "\n".join(cards)
+    return "\n".join(cards) if cards else '<p class="muted">No VMs defined in fleet.json.</p>'
+
+
+def _lcars_fleet_body() -> str:
+    fleet    = load_json(TOOLS_DIR / "fleet.json") or {"vms": []}
+    profiles = [load_json(PROFILE_DIR / f"{v.get('name', '')}.json") or {}
+                for v in fleet.get("vms", [])]
+    total    = len(fleet.get("vms", []))
+    running  = sum(1 for p in profiles
+                   if p.get("instance", {}).get("lifecycle-state") == "RUNNING")
+    down     = sum(1 for p in profiles
+                   if p.get("instance", {}).get("lifecycle-state") in ("TERMINATED", "TERMINATING"))
+    awaiting = max(0, total - running - down)
+    return (
+        '<h1>Fleet Management</h1>'
+        '<div class="stat-row">'
+        f'<div class="stat-block background-golden-orange"><small>Instances</small><strong>{total}</strong></div>'
+        f'<div class="stat-block background-lima-bean"><small>Online</small><strong>{running}</strong></div>'
+        f'<div class="stat-block background-sunglow"><small>Awaiting</small><strong>{awaiting}</strong></div>'
+        f'<div class="stat-block background-tomato"><small>Down</small><strong>{down}</strong></div>'
+        f'{_quota_bars()}'
+        '</div>'
+        f'<div class="vm-grid">{_lcars_vm_cards()}</div>'
+        + _lcars_text_bar("Fleet Events")
+        + fleet_events_html()
+        + '<p class="meta-line">Auto-refreshes every 60 seconds</p>'
+    )
+
 
 
 # ── stats page ────────────────────────────────────────────────────────────────
 
-def stats_page(vm_name: str, fleet_vms: list) -> bytes:
-    title  = f"{FLEET_NAME} — {vm_name} stats"
+def lcars_stats_page(vm_name: str, fleet_vms: list) -> bytes:
     raw    = collect_local_stats() if vm_name == "management" else collect_remote_stats(vm_name)
     output = html.escape(raw)
     now    = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    vm_links = " ".join(
-        f'<a href="/stats?vm={html.escape(v)}" {_ACT if v == vm_name else ""}>{html.escape(v)}</a>'
+    vm_links = "".join(
+        _lcars_pill(f"/stats?vm={html.escape(v)}", v, v == vm_name)
         for v in fleet_vms
     )
-    page = (
-        _head(title)
-        + _topbar("stats")
-        + f'<div class="content">'
-        + f'<div class="vmbar">{vm_links}</div>'
-        + f'<p class="meta">Snapshot taken {now}</p>'
-        + f'<pre>{output}</pre>'
-        + '<div style="display:flex;gap:12px;align-items:center;margin-top:12px">'
-        + f'<a class="btn" href="/stats?vm={html.escape(vm_name)}">Refresh</a>'
-        + '<label><input type="checkbox" onchange="(function(cb){'
-        + 'if(cb.checked){window._ar=setInterval(()=>location.reload(),10000)}'
-        + 'else{clearInterval(window._ar)}})(this)"> Auto-refresh 10s</label>'
-        + '</div>'
-        + f'<p class="section-title">Scheduled Tasks (crontab)</p>'
-        + f'<pre>{html.escape(_read_vm_crontab(vm_name))}</pre>'
-        + '</div></body></html>'
+    body = (
+        f'<h1>{html.escape(vm_name)} telemetry</h1>'
+        f'<div class="btn-row">{vm_links}</div>'
+        f'<p class="meta-line">Snapshot taken {now}</p>'
+        + _lcars_text_bar("System Snapshot")
+        + f'<pre class="readout">{output}</pre>'
+        '<div class="btn-row">'
+        f'<a class="button-golden-orange" href="/stats?vm={html.escape(vm_name)}">Refresh</a>'
+        '<button class="button-bluey" onclick="(function(b){'
+        "if(window._ar){clearInterval(window._ar);window._ar=null;b.textContent='AUTO-REFRESH 10S';}"
+        "else{window._ar=setInterval(function(){location.reload()},10000);b.textContent='AUTO ON';}"
+        '})(this)">Auto-refresh 10s</button>'
+        '</div>'
+        + _lcars_text_bar("Scheduled Tasks")
+        + f'<pre class="readout">{html.escape(_read_vm_crontab(vm_name))}</pre>'
     )
-    return page.encode("utf-8")
+    return _page("stats", f"Stats / {vm_name}", body)
 
 
 # ── logs page ─────────────────────────────────────────────────────────────────
 
-def logs_page(vm_name: str, service_name: str, fleet_vms: list) -> bytes:
-    title  = f"{FLEET_NAME} — {vm_name} logs"
+def lcars_logs_page(vm_name: str, service_name: str, fleet_vms: list) -> bytes:
     raw    = (collect_local_logs(service_name) if vm_name == "management"
               else collect_remote_logs(vm_name, service_name))
     output = html.escape(raw)
     now    = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    vm_links = " ".join(
-        f'<a href="/logs?vm={html.escape(v)}&service={html.escape(service_name)}" '
-        f'{_ACT if v == vm_name else ""}>{html.escape(v)}</a>'
+    vm_links = "".join(
+        _lcars_pill(f"/logs?vm={html.escape(v)}&service={html.escape(service_name)}", v, v == vm_name)
         for v in fleet_vms
     )
-    svc_links = " ".join(
-        f'<a href="/logs?vm={html.escape(vm_name)}&service={html.escape(svc)}" '
-        f'{_ACT if svc == service_name else ""}>{html.escape(label)}</a>'
+    svc_links = "".join(
+        _lcars_pill(f"/logs?vm={html.escape(vm_name)}&service={html.escape(svc)}", label, svc == service_name)
         for svc, label in _LOG_SERVICES
     )
-    page = (
-        _head(title)
-        + _topbar("logs")
-        + f'<div class="content">'
-        + f'<div class="vmbar">{vm_links}</div>'
-        + f'<div class="svcbar">{svc_links}</div>'
-        + f'<p class="meta">Fetched {now}</p>'
-        + f'<pre>{output}</pre>'
-        + '<div style="display:flex;gap:12px;align-items:center;margin-top:12px">'
-        + f'<a class="btn" href="/logs?vm={html.escape(vm_name)}&service={html.escape(service_name)}">Refresh</a>'
-        + '<label><input type="checkbox" onchange="(function(cb){'
-        + 'if(cb.checked){window._ar=setInterval(()=>location.reload(),15000)}'
-        + 'else{clearInterval(window._ar)}})(this)"> Auto-refresh 15s</label>'
-        + '</div></div></body></html>'
+    body = (
+        f'<h1>{html.escape(vm_name)} logs</h1>'
+        f'<div class="btn-row">{vm_links}</div>'
+        f'<div class="btn-row">{svc_links}</div>'
+        f'<p class="meta-line">{html.escape(service_name)} &middot; fetched {now}</p>'
+        + _lcars_text_bar("Log Stream")
+        + f'<pre class="readout">{output}</pre>'
+        '<div class="btn-row">'
+        f'<a class="button-golden-orange" href="/logs?vm={html.escape(vm_name)}&service={html.escape(service_name)}">Refresh</a>'
+        '<button class="button-bluey" onclick="(function(b){'
+        "if(window._ar){clearInterval(window._ar);window._ar=null;b.textContent='AUTO-REFRESH 15S';}"
+        "else{window._ar=setInterval(function(){location.reload()},15000);b.textContent='AUTO ON';}"
+        '})(this)">Auto-refresh 15s</button>'
+        '</div>'
     )
-    return page.encode("utf-8")
+    return _page("logs", f"Logs / {vm_name}", body)
 
 
 # ── login page ────────────────────────────────────────────────────────────────
 
-def login_page(error: bool = False, locked: bool = False) -> bytes:
+def lcars_login_page(error: bool = False, locked: bool = False) -> bytes:
     if locked:
         err = '<p class="error-msg">Too many failed attempts. Try again in 15 minutes.</p>'
     elif error:
         err = '<p class="error-msg">Incorrect username or password.</p>'
     else:
         err = ""
-    page = (
-        _head(FLEET_NAME)
-        + f'<div class="login-wrap"><div class="login-box">'
-        + f'<img id="login-logo" class="login-logo" alt="Fleet Logo">'
-        + f'<h1>{html.escape(FLEET_NAME)}</h1>'
-        + '<p class="sub">Admin Dashboard</p>'
-        + f'{err}'
-        + '<form method="POST" action="/login">'
-        + '<label for="u">Username</label>'
-        + '<input id="u" type="text" name="username" autocomplete="username" autofocus>'
-        + '<label for="p">Password</label>'
-        + '<input id="p" type="password" name="password" autocomplete="current-password">'
-        + '<button type="submit">Sign in</button>'
-        + '</form></div></div></body></html>'
+    body = (
+        '<div class="login-panel lcars-form">'
+        f'<h2>{html.escape(FLEET_NAME)}</h2>'
+        '<p class="meta-line">Admin Dashboard &middot; authorization required</p>'
+        f'{err}'
+        '<form method="POST" action="/login">'
+        '<label for="u">Username</label>'
+        '<input id="u" type="text" name="username" autocomplete="username" autofocus>'
+        '<label for="p">Password</label>'
+        '<input id="p" type="password" name="password" autocomplete="current-password">'
+        '<div class="buttons">'
+        '<button type="submit" class="button-golden-orange">Sign in</button>'
+        '</div>'
+        '</form>'
+        '</div>'
     )
-    return page.encode("utf-8")
+    return _page("login", "Access Control", body)
 
 
 # ── export page ───────────────────────────────────────────────────────────────
 
-def export_page() -> bytes:
+def lcars_export_page() -> bytes:
     fleet = load_json(TOOLS_DIR / "fleet.json") or {"vms": []}
     env   = _mgmt_env()
     lines = [
@@ -1511,24 +2357,21 @@ def export_page() -> bytes:
             f"OCI_{name.upper()}_PRIVATE_IP={priv}",
             "",
         ]
-    ssh_key = env.get("OCI_SSH_PRIVATE_KEY_PATH", "~/.ssh/fleet.key")
+    ssh_key  = env.get("OCI_SSH_PRIVATE_KEY_PATH", "~/.ssh/fleet.key")
     ssh_user = env.get("OCI_SSH_USER", "ubuntu")
     lines += [
         "# SSH",
         f"OCI_SSH_USER={ssh_user}",
         f"OCI_SSH_PRIVATE_KEY_PATH={ssh_key}",
-        f"# SSH example: {ssh_key} {ssh_user}@<public-ip>",
+        f"# SSH example: ssh -i {ssh_key} {ssh_user}@<public-ip>",
     ]
     content = html.escape("\n".join(lines))
-    page = (
-        _head(f"{FLEET_NAME} — Export")
-        + _topbar("export")
-        + f'<div class="content">'
-        + f'<h2 style="margin:0 0 16px">Fleet connection details</h2>'
-        + f'<pre class="export-pre">{content}</pre>'
-        + '</div></body></html>'
+    body = (
+        '<h1>Fleet connection details</h1>'
+        '<p class="meta-line">Copy/paste endpoint and SSH values</p>'
+        f'<pre class="readout wrap-lines">{content}</pre>'
     )
-    return page.encode("utf-8")
+    return _page("export", "Export", body)
 
 
 # ── tools page ───────────────────────────────────────────────────────────────
@@ -1591,10 +2434,64 @@ def run_payload_on_vm(vm_name: str, script: str) -> tuple[bool, str]:
             return False, str(exc)
 
 
-def tools_page(preselect_vm: str = "") -> bytes:
-    title     = f"{FLEET_NAME} — Tools"
-    fleet     = load_json(TOOLS_DIR / "fleet.json") or {"vms": []}
-    vms       = [v.get("name") for v in fleet.get("vms", []) if v.get("name")]
+_TOOL_CARD_COLORS = [
+    "background-bluey",
+    "background-lilac",
+    "background-orange",
+    "background-golden-orange",
+    "background-sky",
+]
+
+_TOOLS_JS_TEMPLATE = """
+var SCRIPTS = %(scripts)s;
+function selectPreset(slug) {
+  document.querySelectorAll('.tool-card').forEach(function(c) { c.classList.remove('selected'); });
+  var card = document.getElementById('preset-' + slug);
+  if (card) card.classList.add('selected');
+  var ed = document.getElementById('payload-editor');
+  if (slug === 'custom') { ed.value = ''; ed.focus(); }
+  else if (SCRIPTS[slug]) { ed.value = SCRIPTS[slug]; }
+}
+function runPayload() {
+  var script = document.getElementById('payload-editor').value.trim();
+  var vm     = document.getElementById('payload-vm').value;
+  var status = document.getElementById('payload-status');
+  var btn    = document.getElementById('run-btn');
+  if (!script) { status.textContent = 'SELECT A PRESET OR WRITE A SCRIPT FIRST'; return; }
+  btn.disabled = true; btn.textContent = 'RUNNING';
+  status.textContent = 'RUNNING ON ' + vm.toUpperCase();
+  var out = document.getElementById('payload-output');
+  out.style.display = 'none';
+  fetch('/run-payload', {method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({vm: vm, script: script})})
+  .then(function(r) { return r.json(); })
+  .then(function(d) {
+    btn.disabled = false; btn.textContent = 'RUN ON VM';
+    status.textContent = d.ok ? 'DONE ON ' + vm.toUpperCase() : 'FAILED ON ' + vm.toUpperCase();
+    out.textContent = d.output || '(no output)'; out.style.display = 'block';
+    document.getElementById('payload-header').style.display = 'flex';
+  })
+  .catch(function(e) {
+    btn.disabled = false; btn.textContent = 'RUN ON VM';
+    status.textContent = 'REQUEST FAILED: ' + e.message;
+    out.textContent = String(e); out.style.display = 'block';
+    document.getElementById('payload-header').style.display = 'flex';
+  });
+}
+function copyOutput() {
+  navigator.clipboard.writeText(document.getElementById('payload-output').textContent)
+  .then(function() {
+    var b = document.getElementById('copy-btn'); b.textContent = 'COPIED';
+    setTimeout(function() { b.textContent = 'COPY'; }, 1500);
+  });
+}
+"""
+
+
+def lcars_tools_page(preselect_vm: str = "") -> bytes:
+    fleet = load_json(TOOLS_DIR / "fleet.json") or {"vms": []}
+    vms   = [v.get("name") for v in fleet.get("vms", []) if v.get("name")]
     if not vms:
         vms = ["management"]
     preselect = preselect_vm if preselect_vm in vms else vms[0]
@@ -1603,102 +2500,59 @@ def tools_page(preselect_vm: str = "") -> bytes:
         f'<option value="{html.escape(v)}"{" selected" if v == preselect else ""}>{html.escape(v)}</option>'
         for v in vms
     )
-
-    # Build preset cards — onclick references a JS object keyed by slug.
-    # Scripts are stored in JS (not in HTML attributes) to avoid > < " escaping issues.
     preset_cards = "".join(
-        f'<div class="payload-card" id="preset-{html.escape(slug)}"'
+        f'<div class="tool-card {color}" id="preset-{html.escape(slug)}"'
         f' data-slug="{html.escape(slug)}" onclick="selectPreset(this.dataset.slug)">'
-        f'<p class="payload-title">{html.escape(label)}</p>'
-        f'<p class="payload-desc">{html.escape(desc)}</p>'
+        f'<span class="tool-title">{html.escape(label)}</span>'
+        f'<span class="tool-desc">{html.escape(desc)}</span>'
         f'</div>'
-        for slug, label, desc, _script in _PAYLOAD_PRESETS
+        for (slug, label, desc, _script), color in zip(
+            _PAYLOAD_PRESETS,
+            _TOOL_CARD_COLORS * (len(_PAYLOAD_PRESETS) // len(_TOOL_CARD_COLORS) + 1),
+        )
     )
-
-    # Serialize scripts as a JS object — json.dumps handles all escaping.
     scripts_js = "{" + ",".join(
         f'{json.dumps(slug)}:{json.dumps(script)}'
         for slug, _label, _desc, script in _PAYLOAD_PRESETS
     ) + "}"
 
-    page = (
-        _head(title)
-        + _topbar("tools")
-        + '<div class="content">'
-        + '<h2 style="margin:0 0 4px">Admin Tools</h2>'
-        + '<p style="color:var(--c-muted);font-size:14px;margin:0 0 4px">'
-        + 'Click a preset to load its script. Select a target VM, then click Run. '
-        + 'The script runs via SSH as bash on remote VMs, or locally on management.</p>'
-        + '<h3 style="font-size:13px;font-weight:700;margin:16px 0 8px;color:var(--c-muted);text-transform:uppercase;letter-spacing:.5px">Presets</h3>'
-        + '<div class="tools-grid">' + preset_cards
-        + '<div class="payload-card" id="preset-custom" data-slug="custom" onclick="selectPreset(this.dataset.slug)">'
-        + '<p class="payload-title">Custom script</p>'
-        + '<p class="payload-desc">Write or paste your own bash script below.</p>'
-        + '</div></div>'
-        + '<h3 style="font-size:13px;font-weight:700;margin:20px 0 8px;color:var(--c-muted);text-transform:uppercase;letter-spacing:.5px">Script</h3>'
+    body = (
+        '<h1>Admin Tools</h1>'
+        '<p>Click a preset to load its script. Select a target VM, then click Run. '
+        'The script runs via SSH as bash on remote VMs, or locally on management.</p>'
+        + _lcars_text_bar("Presets")
+        + f'<div class="tool-grid">{preset_cards}'
+        '<div class="tool-card background-tomato" id="preset-custom" data-slug="custom"'
+        ' onclick="selectPreset(this.dataset.slug)">'
+        '<span class="tool-title">Custom script</span>'
+        '<span class="tool-desc">Write or paste your own bash script below.</span>'
+        '</div></div>'
+        + _lcars_text_bar("Script")
         + '<textarea id="payload-editor" class="script-editor"'
-        + ' placeholder="#!/bin/bash&#10;# Click a preset above, or write your own script here.&#10;# Runs via SSH on the VM selected below."></textarea>'
-        + '<div class="run-bar">'
-        + '<select id="payload-vm" class="vm-select">' + vm_options + '</select>'
-        + '<button class="btn" id="run-btn" onclick="runPayload()">&#9654; Run on VM</button>'
-        + '<span id="payload-status" style="font-size:13px;color:var(--c-muted)"></span>'
-        + '</div>'
-        + '<div id="payload-header" style="display:none;justify-content:space-between;align-items:center;margin-top:16px;margin-bottom:4px">'
-        + '<span style="font-size:11px;font-weight:700;color:var(--c-muted);text-transform:uppercase;letter-spacing:.5px">Output</span>'
-        + '<button id="copy-btn" onclick="copyOutput()" style="font-size:12px;padding:3px 10px;'
-        + 'border:1px solid var(--c-border);border-radius:4px;background:var(--c-bg);'
-        + 'color:var(--c-text);cursor:pointer">&#x2398; Copy</button>'
-        + '</div>'
-        + '<pre id="payload-output" style="margin-top:0;display:none"></pre>'
-        + "<script>"
-        + f"var SCRIPTS={scripts_js};"
-        + "function selectPreset(slug){"
-        + "  document.querySelectorAll('.payload-card').forEach(function(c){c.classList.remove('selected');});"
-        + "  var card=document.getElementById('preset-'+slug);"
-        + "  if(card)card.classList.add('selected');"
-        + "  var ed=document.getElementById('payload-editor');"
-        + "  if(slug==='custom'){ed.value='';ed.focus();}"
-        + "  else if(SCRIPTS[slug]){ed.value=SCRIPTS[slug];}"
-        + "}"
-        + "function runPayload(){"
-        + "  var script=document.getElementById('payload-editor').value.trim();"
-        + "  var vm=document.getElementById('payload-vm').value;"
-        + "  var status=document.getElementById('payload-status');"
-        + "  var btn=document.getElementById('run-btn');"
-        + "  if(!script){status.textContent='Select a preset or write a script first.';return;}"
-        + "  btn.disabled=true;btn.textContent='Running…';"
-        + "  status.textContent='Running on '+vm+'…';"
-        + "  var out=document.getElementById('payload-output');"
-        + "  out.style.display='none';"
-        + "  fetch('/run-payload',{method:'POST',"
-        + "    headers:{'Content-Type':'application/json'},"
-        + "    body:JSON.stringify({vm:vm,script:script})})"
-        + "  .then(function(r){return r.json();})"
-        + "  .then(function(d){"
-        + "    btn.disabled=false;btn.textContent='▶ Run on VM';"
-        + "    status.textContent=d.exit_code===0?'✓ Done on '+vm:'✗ Exit '+d.exit_code+' on '+vm;"
-        + "    out.textContent=d.output||'(no output)';out.style.display='block';"
-        + "    document.getElementById('payload-header').style.display='flex';})"
-        + "  .catch(function(e){"
-        + "    btn.disabled=false;btn.textContent='▶ Run on VM';"
-        + "    status.textContent='Request failed: '+e.message;"
-        + "    out.textContent=String(e);out.style.display='block';"
-        + "    document.getElementById('payload-header').style.display='flex';});}"
-        + "function copyOutput(){"
-        + "  navigator.clipboard.writeText(document.getElementById('payload-output').textContent)"
-        + "  .then(function(){"
-        + "    var b=document.getElementById('copy-btn');b.textContent='✓ Copied';"
-        + "    setTimeout(function(){b.textContent='⎘ Copy';},1500);});}"
-        + "</script>"
-        + '</div></body></html>'
+        ' placeholder="#!/bin/bash&#10;# Click a preset above, or write your own script here.&#10;'
+        '# Runs via SSH on the VM selected below."></textarea>'
+        '<div class="run-bar">'
+        f'<select id="payload-vm" class="vm-select">{vm_options}</select>'
+        '<div class="btn-row" style="margin:0">'
+        '<button class="button-golden-orange" id="run-btn" onclick="runPayload()">Run on VM</button>'
+        '</div>'
+        '<span id="payload-status" class="run-status"></span>'
+        '</div>'
+        '<div id="payload-header" class="run-bar" style="display:none">'
+        '<span class="meta-line" style="margin:0">Output</span>'
+        '<div class="btn-row" style="margin:0">'
+        '<button class="button-sky" id="copy-btn" onclick="copyOutput()">Copy</button>'
+        '</div>'
+        '</div>'
+        '<pre id="payload-output" class="readout wrap-lines" style="display:none;margin-top:.5rem"></pre>'
     )
-    return page.encode("utf-8")
+    return _page("tools", "Admin Tools", body,
+                 page_js=_TOOLS_JS_TEMPLATE % {"scripts": scripts_js})
 
 
 # ── queue page ────────────────────────────────────────────────────────────────
 
-def queue_page(fleet_vms: list) -> bytes:
-    title = f"{FLEET_NAME} — Job Queue"
+def lcars_queue_page(fleet_vms: list) -> bytes:
     sections = []
     for vm in fleet_vms:
         jobs = _read_vm_queue(vm)
@@ -1712,40 +2566,34 @@ def queue_page(fleet_vms: list) -> bytes:
                 rows.append(
                     f'<tr>'
                     f'<td><span class="badge badge-{html.escape(st)}">{html.escape(st)}</span></td>'
-                    f'<td>{html.escape(j.get("label","?"))}</td>'
-                    f'<td class="muted">{html.escape(str(j.get("priority","?")))}</td>'
-                    f'<td class="muted">{html.escape(j.get("queued_at","")[:16])}</td>'
-                    f'<td class="muted">{html.escape(j.get("completed_at","")[:16])}</td>'
-                    f'<td><div class="q-output">{out}</div></td>'
+                    f'<td>{html.escape(j.get("label", "?"))}</td>'
+                    f'<td class="muted">{html.escape(str(j.get("priority", "?")))}</td>'
+                    f'<td class="muted">{html.escape(j.get("queued_at", "")[:16])}</td>'
+                    f'<td class="muted">{html.escape(j.get("completed_at", "")[:16])}</td>'
+                    f'<td><div class="job-output">{out}</div></td>'
                     f'</tr>'
                 )
             rows_html = (
-                '<table class="q-table"><thead><tr>'
+                '<div class="table-scroll"><table class="lcars-table"><thead><tr>'
                 '<th>Status</th><th>Label</th><th>Pri</th>'
                 '<th>Queued</th><th>Done</th><th>Output</th>'
-                '</tr></thead><tbody>' + "".join(rows) + '</tbody></table>'
+                '</tr></thead><tbody>' + "".join(rows) + '</tbody></table></div>'
             )
-        sections.append(f'<p class="section-title">{html.escape(vm)}</p>' + rows_html)
-    page = (
-        _head(title)
-        + _topbar("queue")
-        + '<div class="content">'
-        + '<p style="font-size:13px;color:var(--c-muted);margin:0 0 16px">'
-        + 'On-demand job queue &#8212; tasks submitted via this console or the <code>/enqueue</code> API. '
-        + '&#8220;No jobs&#8221; is normal on a fresh deployment until a job is submitted. '
-        + 'Background systemd services are not shown here &#8212; '
-        + 'those appear as service chips on the <a href="/">Fleet</a> page.'
-        + '</p>'
+        sections.append(_lcars_text_bar(vm, level="h4") + rows_html)
+    body = (
+        '<h1>Job Queue</h1>'
+        '<p>On-demand job queue &#8212; tasks submitted via this console or the '
+        '<code>/enqueue</code> API. &#8220;No jobs&#8221; is normal on a fresh deployment. '
+        'Background systemd services are not shown here &#8212; those appear on the '
+        '<a href="/">Fleet</a> page.</p>'
         + "".join(sections)
-        + '</div></body></html>'
     )
-    return page.encode("utf-8")
+    return _page("queue", "Job Queue", body)
 
 
 # ── audit log page ─────────────────────────────────────────────────────────────
 
-def audit_page() -> bytes:
-    title   = f"{FLEET_NAME} — Audit Log"
+def lcars_audit_page() -> bytes:
     entries: list[dict] = []
     if AUDIT_LOG.exists():
         try:
@@ -1757,31 +2605,96 @@ def audit_page() -> bytes:
             pass
     entries.reverse()
     if not entries:
-        body = '<p class="muted">No audit entries yet.</p>'
+        rows_html = '<p class="muted">No audit entries yet.</p>'
     else:
         rows = []
         for e in entries:
             rows.append(
                 f'<div class="audit-row">'
-                f'<span class="audit-ts">{html.escape(e.get("ts","")[:16])}</span>'
-                f'<span class="audit-who">{html.escape(e.get("ip","?"))}</span>'
-                f'<span class="audit-act">{html.escape(e.get("action","?"))}</span>'
-                f'<span class="audit-vm">{html.escape(e.get("vm","—"))}</span>'
-                f'<span class="audit-det">{html.escape(e.get("details",""))}</span>'
+                f'<span class="audit-ts">{html.escape(e.get("ts", "")[:16])}</span>'
+                f'<span class="audit-who">{html.escape(e.get("ip", "?"))}</span>'
+                f'<span class="audit-act">{html.escape(e.get("action", "?"))}</span>'
+                f'<span class="audit-vm">{html.escape(e.get("vm", "—"))}</span>'
+                f'<span class="audit-det">{html.escape(e.get("details", ""))}</span>'
                 f'</div>'
             )
-        body = "".join(rows)
-    page = (
-        _head(title)
-        + _topbar("audit")
-        + '<div class="content">'
-        + '<p style="font-size:13px;color:var(--c-muted);margin:0 0 16px">'
-        + 'Audit log &#8212; admin actions recorded by this console: script runs, service control, job submissions. '
-        + 'Written to <code>~/cloud-lab/logs/audit.jsonl</code> on the management VM. '
-        + 'Last 200 entries shown, newest first.'
-        + '</p>' + body + '</div></body></html>'
+        rows_html = "".join(rows)
+    body = (
+        '<h1>Audit Log</h1>'
+        '<p>Admin actions recorded by this console: script runs, service control, '
+        'job submissions. Written to <code>~/cloud-lab/logs/audit.jsonl</code> on the '
+        'management VM. Last 200 entries shown, newest first.</p>'
+        + _lcars_text_bar("Action Trail")
+        + rows_html
     )
-    return page.encode("utf-8")
+    return _page("audit", "Audit Log", body)
+
+
+# ── LCARS settings page ───────────────────────────────────────────────────────
+
+_SETTINGS_JS = """
+function setCookie(k, v) { document.cookie = k + '=' + v + '; Path=/; SameSite=Strict; Max-Age=31536000'; }
+function setUiMode(m) { setCookie('fleet_ui_mode', m); window.location.href = '/'; }
+function setLcarsLayout(l) { setCookie('lcars_layout', l); location.reload(); }
+function uiScale(v) {
+  document.documentElement.style.setProperty('--ui-scale', v / 100);
+  setCookie('ui_scale', v);
+  var el = document.getElementById('scale-val'); if (el) el.textContent = v + '%';
+}
+function resetScale() {
+  uiScale(100);
+  var s = document.getElementById('scale-slider'); if (s) s.value = 100;
+}
+function setBeeps(on) {
+  localStorage.setItem('lcars-beeps', on ? '1' : '0');
+  markBeeps(); applyBeepVolume();
+}
+function markBeeps() {
+  var off = localStorage.getItem('lcars-beeps') === '0';
+  document.getElementById('beeps-on').classList.toggle('current', !off);
+  document.getElementById('beeps-off').classList.toggle('current', off);
+}
+markBeeps();
+"""
+
+
+def lcars_settings_page(layout: str, scale: float) -> bytes:
+    pct = int(round(scale * 100))
+    t_cur = ' class="current"' if layout != "c" else ""
+    c_cur = ' class="current"' if layout == "c" else ""
+    body = (
+        '<h1>Console Setup</h1>'
+        + _lcars_text_bar("Interface Mode")
+        + '<div class="btn-row">'
+        '<button class="current">LCARS</button>'
+        '<button onclick="setUiMode(\'standard\')">Standard console</button>'
+        '</div>'
+        '<p class="meta-line">Standard mode has its own dark mode and color palettes '
+        'under its gear icon &#8212; including the switch back to LCARS.</p>'
+        + _lcars_text_bar("Frame Layout")
+        + '<div class="btn-row">'
+        f'<button{t_cur} onclick="setLcarsLayout(\'t\')">Sideways T</button>'
+        f'<button{c_cur} onclick="setLcarsLayout(\'c\')">Full frame C</button>'
+        '</div>'
+        '<p class="meta-line">The C layout closes the frame with a bottom bar.</p>'
+        + _lcars_text_bar("Interface Scale")
+        + '<div class="run-bar">'
+        f'<input id="scale-slider" type="range" min="70" max="140" step="5" value="{pct}"'
+        ' oninput="uiScale(this.value)">'
+        f'<span id="scale-val" class="run-status">{pct}%</span>'
+        '<div class="btn-row" style="margin:0">'
+        '<button class="button-bluey" onclick="resetScale()">Reset</button>'
+        '</div>'
+        '</div>'
+        '<p class="meta-line">Applies live &middot; saved for this browser.</p>'
+        + _lcars_text_bar("Audio")
+        + '<div class="btn-row">'
+        '<button id="beeps-on" onclick="setBeeps(1)">Beeps on</button>'
+        '<button id="beeps-off" onclick="setBeeps(0)">Beeps off</button>'
+        '</div>'
+    )
+    return _page("settings", "Console Setup", body, page_js=_SETTINGS_JS)
+
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
@@ -1805,15 +2718,32 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return None
 
+    def _ui_mode(self) -> str:
+        """Read UI cookies; prime the per-request LCARS presentation state."""
+        cookies = _parse_cookies(self.headers.get("Cookie", ""))
+        try:
+            scale = float(cookies.get("ui_scale", "100")) / 100.0
+        except ValueError:
+            scale = 1.0
+        _ui_ctx.scale  = min(1.4, max(0.7, scale))
+        _ui_ctx.layout = "c" if cookies.get("lcars_layout") == "c" else "t"
+        mode = cookies.get("fleet_ui_mode", DEFAULT_UI_MODE)
+        return "lcars" if mode == "lcars" else "standard"
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path   = parsed.path.rstrip("/") or "/"
         qs     = parse_qs(parsed.query)
+        lcars  = self._ui_mode() == "lcars"
+
+        if path.startswith("/static/"):
+            self._static_file(path)
+            return
 
         if path == "/login":
             if DEV_MODE:
                 self._redirect("/"); return
-            self._html(200, login_page()); return
+            self._html(200, lcars_login_page() if lcars else std_login_page()); return
         if path == "/logout":
             if DEV_MODE:
                 self._redirect("/"); return
@@ -1831,26 +2761,19 @@ class Handler(BaseHTTPRequestHandler):
             self._redirect("/login"); return
 
         if path == "/":
-            fleet  = load_json(TOOLS_DIR / "fleet.json") or {"vms": []}
-            names  = [v.get("name") for v in fleet.get("vms", []) if v.get("name")]
-            cards  = vm_cards()
-            events = fleet_events_html()
-            page = (
-                _head(FLEET_NAME, auto_refresh=60)
-                + _topbar("fleet")
-                + f'<div class="content">'
-                + f'<div class="grid">{cards}</div>'
-                + f'<p class="section-title">Oracle Free Tier Quota</p>'
-                + f'<div class="quota-section">{_quota_html()}</div>'
-                + f'<p class="section-title">Recent Fleet Events</p>'
-                + f'<div>{events}</div>'
-                + '<p style="margin:24px 0 0;font-size:13px;color:var(--c-muted);text-align:center">'
-                + '<a href="/tools">Tools</a> &nbsp;&middot;&nbsp; <a href="/queue">Queue</a> &nbsp;&middot;&nbsp; <a href="/audit">Audit log</a>'
-                + '</p>'
-                + f'<footer>Auto-refreshes every 60s &middot; management VM</footer>'
-                + '</div></body></html>'
-            )
-            self._html(200, page.encode()); return
+            if lcars:
+                self._html(200, _page("fleet", "Fleet Management", _lcars_fleet_body(),
+                                      auto_refresh=60))
+            else:
+                self._html(200, std_fleet_page())
+            return
+
+        if path == "/settings":
+            if not lcars:
+                self._redirect("/"); return
+            self._html(200, lcars_settings_page(getattr(_ui_ctx, "layout", "t"),
+                                                getattr(_ui_ctx, "scale", 1.0)))
+            return
 
         if path == "/stats":
             fleet     = load_json(TOOLS_DIR / "fleet.json") or {"vms": []}
@@ -1858,7 +2781,7 @@ class Handler(BaseHTTPRequestHandler):
             vm_name   = qs.get("vm", ["management"])[0]
             if vm_name not in fleet_vms:
                 vm_name = "management"
-            self._html(200, stats_page(vm_name, fleet_vms)); return
+            self._html(200, (lcars_stats_page if lcars else std_stats_page)(vm_name, fleet_vms)); return
 
         if path == "/logs":
             fleet       = load_json(TOOLS_DIR / "fleet.json") or {"vms": []}
@@ -1869,22 +2792,22 @@ class Handler(BaseHTTPRequestHandler):
             service     = service_raw if service_raw in valid_svcs else "cloud-lab-a1-lottery"
             if vm_name not in fleet_vms:
                 vm_name = fleet_vms[0] if fleet_vms else "management"
-            self._html(200, logs_page(vm_name, service, fleet_vms)); return
+            self._html(200, (lcars_logs_page if lcars else std_logs_page)(vm_name, service, fleet_vms)); return
 
         if path == "/export":
-            self._html(200, export_page()); return
+            self._html(200, lcars_export_page() if lcars else std_export_page()); return
 
         if path == "/tools":
             preselect = qs.get("vm", [""])[0]
-            self._html(200, tools_page(preselect)); return
+            self._html(200, (lcars_tools_page if lcars else std_tools_page)(preselect)); return
 
         if path == "/queue":
             fleet     = load_json(TOOLS_DIR / "fleet.json") or {"vms": []}
             names     = [v.get("name") for v in fleet.get("vms", []) if v.get("name")]
-            self._html(200, queue_page(names)); return
+            self._html(200, (lcars_queue_page if lcars else std_queue_page)(names)); return
 
         if path == "/audit":
-            self._html(200, audit_page()); return
+            self._html(200, lcars_audit_page() if lcars else std_audit_page()); return
 
         if path == "/health":
             # Lightweight liveness probe for UptimeRobot / external monitors. No auth.
@@ -1901,6 +2824,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
         path   = parsed.path.rstrip("/") or "/"
+        login_pg = lcars_login_page if self._ui_mode() == "lcars" else std_login_page
 
         if path == "/run-payload":
             if not _is_authed(self):
@@ -1996,7 +2920,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/login":
             raw_body = self._read_body(MAX_LOGIN_BODY)
             if raw_body is None:
-                self._html(400, login_page(error=True)); return
+                self._html(400, login_pg(error=True)); return
             body    = raw_body.decode("utf-8", errors="replace")
             fields  = parse_qs(body)
             uname   = fields.get("username", [""])[0].strip()
@@ -2004,7 +2928,7 @@ class Handler(BaseHTTPRequestHandler):
             client  = self.client_address[0]
 
             if not _check_rate_limit(client):
-                self._html(429, login_page(error=True, locked=True)); return
+                self._html(429, login_pg(error=True, locked=True)); return
             if uname == USERNAME and _verify_password(pw):
                 _clear_fails(client)
                 sid = _create_session()
@@ -2013,7 +2937,7 @@ class Handler(BaseHTTPRequestHandler):
                     f'Path=/; HttpOnly; Secure; SameSite=Strict')
             else:
                 _record_fail(client)
-                self._html(401, login_page(error=True))
+                self._html(401, login_pg(error=True))
             return
 
         self._html(404, b"Not found")
@@ -2023,21 +2947,71 @@ class Handler(BaseHTTPRequestHandler):
     def _html(self, code: int, body: bytes | str) -> None:
         if isinstance(body, str):
             body = body.encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return
 
     def _json(self, code: int, data: dict) -> None:
         body = json.dumps(data).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return
+
+    def _static_file(self, path: str) -> None:
+        rel = path.removeprefix("/static/").replace("/", os.sep)
+        try:
+            static_root = STATIC_DIR.resolve()
+            file_path = (STATIC_DIR / rel).resolve()
+        except Exception:
+            self._html(404, b"Not found")
+            return
+        if static_root != file_path and static_root not in file_path.parents:
+            self._html(404, b"Not found")
+            return
+        if not file_path.is_file():
+            self._html(404, b"Not found")
+            return
+        suffix = file_path.suffix.lower()
+        content_type = {
+            ".css": "text/css; charset=utf-8",
+            ".js": "application/javascript; charset=utf-8",
+            ".svg": "image/svg+xml",
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".gif": "image/gif",
+            ".woff2": "font/woff2",
+            ".woff": "font/woff",
+            ".m4a": "audio/mp4",
+            ".ogg": "audio/ogg",
+            ".webm": "audio/webm",
+        }.get(suffix, "application/octet-stream")
+        body = file_path.read_bytes()
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            if DEV_MODE or suffix in {".css", ".js"}:
+                self.send_header("Cache-Control", "no-cache, max-age=0")
+            else:
+                self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return
 
     def _redirect(self, location: str, set_cookie: str = "") -> None:
         self.send_response(303)

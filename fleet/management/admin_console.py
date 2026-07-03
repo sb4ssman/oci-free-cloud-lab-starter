@@ -2004,10 +2004,8 @@ def _lcars_data_cascade() -> str:
     return '<div class="data-cascade-wrapper" id="default">' + "".join(cols) + '</div>'
 
 
-def _page(active: str, banner: str, content: str, *,
-          auto_refresh: int = 0, page_js: str = "") -> bytes:
-    """Wrap page content in the full LCARS chassis and return encoded HTML."""
-    layout = getattr(_ui_ctx, "layout", "t")
+def _t_frame(active: str, banner: str, content: str, fleet_h: str, footer: str) -> str:
+    """TheLCARS standard 'sideways T' — header elbow + rail + content elbow."""
     nav_parts = []
     for num, label, href, key in _NAV_ITEMS:
         cur = ' class="nav-current"' if key == active else ""
@@ -2020,10 +2018,7 @@ def _page(active: str, banner: str, content: str, *,
         f'<span class="hop">{num}-</span>{label}</button>'
         for cls, num, label, href in _SIDE_PANELS
     )
-    fleet_h = html.escape(FLEET_NAME.upper())
-    page = (
-        _lcars_head(f"{FLEET_NAME} — {banner}", auto_refresh=auto_refresh)
-        + '<section class="wrap-standard" id="column-3">'
+    return (
         '<div class="wrap">'
         '<div class="left-frame-top">'
         f'<button onclick="playSoundAndRedirect(\'audio2\',\'/\')" class="panel-1-button">{fleet_h}</button>'
@@ -2054,6 +2049,82 @@ def _page(active: str, banner: str, content: str, *,
         '<div class="bar-9"></div><div class="bar-10"></div>'
         '</div>'
         f'<main>{content}</main>'
+        f'{footer}'
+        '</div>'
+        '</div>'
+    )
+
+
+_C_RAIL_ITEMS = [
+    ("FLEET",  "/",       "fleet",  "background-gold"),
+    ("STATS",  "/stats",  "stats",  "background-bluey"),
+    ("LOGS",   "/logs",   "logs",   "background-lilac"),
+    ("EXPORT", "/export", "export", "background-ice"),
+]
+
+
+def _c_frame(active: str, banner: str, content: str, fleet_h: str, footer: str,
+             auto_refresh: int) -> str:
+    """Fully enclosed 'C' frame — top bar, left rail, bottom bar, all connected."""
+    rail_parts = [
+        '<button onclick="topFunction(); playSound()" id="topBtn"><span class="hop">screen</span> top</button>'
+    ]
+    for label, href, key, color in _C_RAIL_ITEMS:
+        cur = " nav-current" if key == active else ""
+        rail_parts.append(
+            f'<button class="{color}{cur}" '
+            f'onclick="playSoundAndRedirect(\'audio2\',\'{href}\')">{label}</button>'
+        )
+    rail_parts.append('<div class="rail-fill"></div>')
+    rail_parts.append(
+        '<button class="background-red" '
+        'onclick="playSoundAndRedirect(\'audio2\',\'/logout\')">Sign out</button>'
+    )
+    rail = "".join(rail_parts)
+    setup_cur = ' class="background-almond nav-current"' if active == "settings" \
+                else ' class="background-almond"'
+    refresh_label = f"Auto-refresh {auto_refresh}s" if auto_refresh else "LCARS 47.3"
+    return (
+        '<div class="wrap">'
+        '<div class="cframe-elbow cframe-elbow--top"></div>'
+        '<div class="cframe-right cframe-right--top">'
+        '<div class="cframe-bar">'
+        f'<div class="bar-fill">{html.escape(banner)}&nbsp;&#149;&nbsp;<span id="Stardate"></span></div>'
+        '<div class="cframe-chip"></div>'
+        '<div class="cframe-chip cframe-chip--red"></div>'
+        f'<div class="cframe-cap">{fleet_h}</div>'
+        '</div>'
+        '</div>'
+        '</div>'
+        '<div class="wrap">'
+        f'<div class="cframe-rail">{rail}</div>'
+        '<div class="cframe-main">'
+        f'<main>{content}</main>'
+        f'{footer}'
+        '</div>'
+        '</div>'
+        '<div class="wrap">'
+        '<div class="cframe-elbow cframe-elbow--bottom">L4-7</div>'
+        '<div class="cframe-right cframe-right--bottom">'
+        '<div class="cframe-bar">'
+        f'<div class="bar-fill">LCARS 47.3 &middot; {html.escape(active)}</div>'
+        '<a class="background-gold" href="/tools">Tools</a>'
+        '<a class="background-bluey" href="/queue">Queue</a>'
+        '<a class="background-lilac" href="/audit">Audit log</a>'
+        f'<a{setup_cur} href="/settings">Setup</a>'
+        f'<div class="cframe-cap">{html.escape(refresh_label)}</div>'
+        '</div>'
+        '</div>'
+        '</div>'
+    )
+
+
+def _page(active: str, banner: str, content: str, *,
+          auto_refresh: int = 0, page_js: str = "") -> bytes:
+    """Wrap page content in the LCARS chassis (T or C layout) and return HTML."""
+    layout = getattr(_ui_ctx, "layout", "t")
+    fleet_h = html.escape(FLEET_NAME.upper())
+    footer = (
         '<footer>'
         f'{fleet_h} admin console &middot; runs on the management VM<br>'
         'LCARS Inspired Website Template by <a href="https://www.thelcars.com">TheLCARS.com</a><br>'
@@ -2061,7 +2132,16 @@ def _page(active: str, banner: str, content: str, *,
         'This private console is not affiliated with CBS Studios Inc. '
         'LCARS was designed by Michael Okuda.'
         '</footer>'
-        f'<script src="{_LC}/lcars.js?v={STATIC_ASSET_VERSION}"></script>'
+    )
+    if layout == "c":
+        frame = _c_frame(active, banner, content, fleet_h, footer, auto_refresh)
+    else:
+        frame = _t_frame(active, banner, content, fleet_h, footer)
+    page = (
+        _lcars_head(f"{FLEET_NAME} — {banner}", auto_refresh=auto_refresh)
+        + '<section class="wrap-standard" id="column-3">'
+        + frame
+        + f'<script src="{_LC}/lcars.js?v={STATIC_ASSET_VERSION}"></script>'
         f'<script>{CONSOLE_JS}{page_js}</script>'
         '<div class="headtrim"></div>'
         '<div class="baseboard"></div>'
@@ -2069,23 +2149,8 @@ def _page(active: str, banner: str, content: str, *,
         f'<audio id="audio2" src="{_LC}/beep2.mp3" preload="auto"></audio>'
         f'<audio id="audio3" src="{_LC}/beep3.mp3" preload="auto"></audio>'
         f'<audio id="audio4" src="{_LC}/beep4.mp3" preload="auto"></audio>'
-        '</div>'
-        '</div>'
+        '</section></body></html>'
     )
-    if layout == "c":
-        # Full-frame "C" — close the bottom of the frame with a mirrored elbow band.
-        page += (
-            '<div class="wrap">'
-            '<div class="frame-close-left">L4-7</div>'
-            '<div class="frame-close-right">'
-            '<div class="bar-panel">'
-            '<div class="bar-6"></div><div class="bar-7"></div><div class="bar-8"></div>'
-            '<div class="bar-9"></div><div class="bar-10"></div>'
-            '</div>'
-            '</div>'
-            '</div>'
-        )
-    page += '</section></body></html>'
     return page.encode("utf-8")
 
 

@@ -22,56 +22,176 @@ input[type="range"] {
 	accent-color: var(--golden-orange);
 }
 
-/* ── C-frame bottom closure (layout option) ────────────────────────────── */
+/* ── C-frame chassis (layout option) ───────────────────────────────────── */
+/* Fully enclosed frame: slim top bar w/ title, left rail of nav buttons,
+   bottom bar w/ status + quick buttons. Corners use the framework radii. */
 
-.frame-close-left {
+:root { --cbar-h: 52px; }
+
+@media (width <= 950px) { :root { --cbar-h: 38px; } }
+@media (width <= 540px) { :root { --cbar-h: 26px; } }
+
+.cframe-elbow {
 	flex: none;
 	width: var(--lfw);
-	min-height: 90px;
 	display: flex;
 	align-items: flex-end;
 	justify-content: flex-end;
 	padding: var(--left-frame-padding);
-	background-color: var(--left-frame-color);
-	border-radius: var(--radius-top);
+	background-color: var(--golden-orange);
 	font-size: clamp(.875rem, 2vw, 1rem);
 	font-weight: bold;
 	text-align: right;
 	color: black;
 }
 
-.frame-close-right {
+/* elbow must reach past the 60px inner corner cut so the curve closes cleanly */
+.cframe-elbow--top    { min-height: calc(var(--cbar-h) + 60px); border-radius: var(--radius-bottom); }
+.cframe-elbow--bottom { min-height: calc(var(--cbar-h) + 60px); border-radius: var(--radius-top); align-items: flex-start; }
+
+.cframe-right {
 	flex: 1;
 	position: relative;
 	display: flex;
 	flex-direction: column;
+}
+
+.cframe-right--top    { justify-content: flex-start; }
+.cframe-right--bottom { justify-content: flex-end; }
+
+.cframe-right--top::before,
+.cframe-right--top::after {
+	content: '';
+	width: 60px;
+	height: 60px;
+	position: absolute;
+	left: 0;
+	top: var(--cbar-h);
+	z-index: -1;
+}
+
+.cframe-right--top::before { background-color: var(--golden-orange); }
+.cframe-right--top::after  { background-color: black; border-radius: 60px 0 0 0; }
+
+.cframe-right--bottom::before,
+.cframe-right--bottom::after {
+	content: '';
+	width: 60px;
+	height: 60px;
+	position: absolute;
+	left: 0;
+	bottom: var(--cbar-h);
+	z-index: -1;
+}
+
+.cframe-right--bottom::before { background-color: var(--golden-orange); }
+.cframe-right--bottom::after  { background-color: black; border-radius: var(--radius-content-top); }
+
+.cframe-bar {
+	display: flex;
+	gap: .3rem;
+	height: var(--cbar-h);
+}
+
+.cframe-bar .bar-fill {
+	flex: 1;
+	min-width: 0;
+	display: flex;
+	align-items: center;
 	justify-content: flex-end;
+	padding: 0 1.2rem;
+	background-color: var(--golden-orange);
+	font-size: clamp(.8rem, 1.6vw, 1.2rem);
+	font-weight: bold;
+	text-transform: uppercase;
+	white-space: nowrap;
+	overflow: hidden;
+	color: black;
 }
 
-.frame-close-right::before {
-	content: '';
-	width: 60px;
-	height: 60px;
-	background-color: var(--left-frame-color);
-	position: absolute;
-	left: 0;
-	bottom: var(--bar-height);
-	z-index: -1;
+.cframe-chip        { flex: none; width: 64px; background-color: var(--bluey); }
+.cframe-chip--red   { width: 40px; background-color: var(--red); }
+
+.cframe-cap {
+	flex: none;
+	min-width: 150px;
+	display: flex;
+	align-items: center;
+	justify-content: flex-end;
+	padding: 0 1.1rem;
+	background-color: var(--ice);
+	border-radius: 0 calc(var(--cbar-h) / 2) calc(var(--cbar-h) / 2) 0;
+	font-size: clamp(.7rem, 1.4vw, .95rem);
+	font-weight: bold;
+	text-transform: uppercase;
+	letter-spacing: .08em;
+	color: black;
 }
 
-.frame-close-right::after {
-	content: '';
-	width: 60px;
-	height: 60px;
-	background-color: black;
-	border-radius: var(--radius-content-top);
-	position: absolute;
-	left: 0;
-	bottom: var(--bar-height);
-	z-index: -1;
+.cframe-bar a {
+	flex: none;
+	display: flex;
+	align-items: center;
+	justify-content: flex-end;
+	padding: 0 1.3rem;
+	font-size: clamp(.7rem, 1.4vw, .95rem);
+	font-weight: bold;
+	text-transform: uppercase;
+	text-decoration: none;
+	color: black;
+	-webkit-user-select: none;
+	user-select: none;
 }
 
-.frame-close-right .bar-8 { align-self: flex-end; }
+.cframe-rail {
+	flex: none;
+	width: var(--lfw);
+	display: flex;
+	flex-direction: column;
+}
+
+.cframe-rail button,
+.cframe-rail a {
+	display: flex;
+	align-items: flex-end;
+	justify-content: flex-end;
+	min-height: 3.4rem;
+	padding: var(--left-frame-padding);
+	border: none;
+	border-bottom: var(--panel-border);
+	background-color: var(--button-color);
+	font-size: clamp(.875rem, 2vw, 1rem);
+	font-weight: bold;
+	text-transform: uppercase;
+	text-align: right;
+	text-decoration: none;
+	color: black;
+	cursor: pointer;
+	-webkit-user-select: none;
+	user-select: none;
+}
+
+.cframe-rail .rail-fill {
+	flex: 1;
+	min-height: 4rem;
+	background-color: var(--gray);
+	border-bottom: var(--panel-border);
+}
+
+.cframe-rail .nav-current { background-color: var(--space-white) !important; }
+
+/* the fixed screen-top button collides with the enclosed frame — not needed here */
+.cframe-rail #topBtn { display: none !important; }
+
+.cframe-bar .nav-current { background-color: var(--space-white) !important; }
+
+.cframe-main {
+	flex: 1;
+	min-width: 0;
+}
+
+/* the C-frame's top bar already carries the page title */
+.cframe-main main > h1:first-child { display: none; }
 
 /* ── nav state ─────────────────────────────────────────────────────────── */
 

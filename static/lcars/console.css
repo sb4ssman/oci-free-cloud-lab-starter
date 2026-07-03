@@ -24,94 +24,86 @@ input[type="range"] {
 
 /* ── C-frame chassis (layout option) ───────────────────────────────────── */
 /* Fully enclosed frame: slim top bar w/ title, left rail of nav buttons,
-   bottom bar w/ status + quick buttons. Corners use the framework radii. */
+   bottom bar w/ status + quick buttons. The elbows are composed of a band
+   piece (rounded outer corner) plus a stem at the rail's start/end, with the
+   concave inner curve drawn by .cframe-cut over the content column — so the
+   content sits right beside the elbow with no dead band. */
 
-:root { --cbar-h: 52px; }
+:root { --cbar-h: 52px; --ccut: 48px; }
 
-@media (width <= 950px) { :root { --cbar-h: 38px; } }
-@media (width <= 540px) { :root { --cbar-h: 26px; } }
+@media (width <= 950px) { :root { --cbar-h: 38px; --ccut: 36px; } }
+@media (width <= 540px) { :root { --cbar-h: 26px; --ccut: 24px; } }
+
+.cframe-band { overflow: visible; }
 
 .cframe-elbow {
 	flex: none;
 	width: var(--lfw);
+	height: var(--cbar-h);
+	background-color: var(--golden-orange);
+}
+
+.cframe-elbow--top    { border-radius: var(--radius-bottom); }
+.cframe-elbow--bottom { border-radius: var(--radius-top); }
+
+/* elbow stems — first/last rail segments, flush with the band pieces */
+
+.cframe-stem {
+	flex: none;
 	display: flex;
-	align-items: flex-end;
+	flex-direction: column;
 	justify-content: flex-end;
+	align-items: flex-end;
+	gap: .1rem;
+	min-height: calc(var(--ccut) + 1.4rem);
 	padding: var(--left-frame-padding);
 	background-color: var(--golden-orange);
-	font-size: clamp(.875rem, 2vw, 1rem);
-	font-weight: bold;
 	text-align: right;
 	color: black;
 }
 
-/* elbow must reach past the 60px inner corner cut so the curve closes cleanly */
-.cframe-elbow--top {
-	min-height: calc(var(--cbar-h) + 60px);
-	border-radius: var(--radius-bottom);
-	flex-direction: column;
-	justify-content: flex-end;
-	gap: .1rem;
-}
+.cframe-stem--top    { margin-bottom: var(--divider-height); }
+.cframe-stem--bottom { margin-top: var(--divider-height); justify-content: flex-start; }
 
-.cframe-elbow--bottom {
-	min-height: calc(var(--cbar-h) + 60px);
-	border-radius: var(--radius-top);
-	align-items: flex-start;
-}
-
-.cframe-elbow .elbow-code {
+.cframe-stem .elbow-code {
 	font-size: .6rem;
 	font-weight: 600;
 	letter-spacing: .14em;
 	text-transform: uppercase;
 }
 
-.cframe-elbow .elbow-label {
+.cframe-stem .elbow-label {
 	font-size: 1.05rem;
 	font-weight: bold;
 	line-height: 1;
 }
 
-.cframe-right {
-	flex: 1;
-	position: relative;
-	display: flex;
-	flex-direction: column;
-}
+/* concave inner curves at the frame corners, drawn over the content column */
 
-.cframe-right--top    { justify-content: flex-start; }
-.cframe-right--bottom { justify-content: flex-end; }
-
-.cframe-right--top::before,
-.cframe-right--top::after {
-	content: '';
-	width: 60px;
-	height: 60px;
+.cframe-cut {
 	position: absolute;
 	left: 0;
-	top: var(--cbar-h);
-	z-index: -1;
+	width: var(--ccut);
+	height: var(--ccut);
+	background-color: var(--golden-orange);
+	z-index: 0;
 }
 
-.cframe-right--top::before { background-color: var(--golden-orange); }
-.cframe-right--top::after  { background-color: black; border-radius: 60px 0 0 0; }
-
-.cframe-right--bottom::before,
-.cframe-right--bottom::after {
+.cframe-cut::before {
 	content: '';
-	width: 60px;
-	height: 60px;
 	position: absolute;
-	left: 0;
-	bottom: var(--cbar-h);
-	z-index: -1;
+	inset: 0;
+	background-color: black;
 }
 
-.cframe-right--bottom::before { background-color: var(--golden-orange); }
-.cframe-right--bottom::after  { background-color: black; border-radius: var(--radius-content-top); }
+.cframe-cut--top             { top: 0; }
+.cframe-cut--top::before     { border-radius: var(--ccut) 0 0 0; }
+.cframe-cut--bottom          { bottom: 0; }
+.cframe-cut--bottom::before  { border-radius: 0 0 0 var(--ccut); }
 
 .cframe-bar {
+	flex: 1;
+	min-width: 0;
 	display: flex;
 	gap: .3rem;
 	height: var(--cbar-h);
@@ -172,8 +164,6 @@ input[type="range"] {
 	width: var(--lfw);
 	display: flex;
 	flex-direction: column;
-	/* black breaks between the rail and both elbows */
-	padding-block: var(--divider-height);
 }
 
 .cframe-rail button,
@@ -214,16 +204,24 @@ input[type="range"] {
 .cframe-main {
 	flex: 1;
 	min-width: 0;
+	position: relative;
+}
+
+.cframe-main main,
+.cframe-main footer {
+	position: relative;
+	z-index: 1;
+	padding-left: clamp(calc(var(--ccut) + 12px), 5vw, calc(var(--ccut) + 40px));
 }
 
 /* the C-frame's top bar already carries the page title */
 .cframe-main main > h1:first-child { display: none; }
 
-/* ── LCARS theme bridges ───────────────────────────────────────────────── */
-/* Non-classic themes load the official TheLCARS.com theme stylesheet as the
-   base (different var names: --evening, --tangerine, --october-sunset, …).
-   These blocks bridge the Classic var names used by the console's own
-   components onto each theme's palette. Alert reds stay red. */
+/* ── LCARS color themes ────────────────────────────────────────────────── */
+/* Themes are named-color overrides on <html data-lcars-palette="...">, over
+   the Classic (V26) base sheet — the chassis and every component follow the
+   vars. Hues for Nemesis Blue / Lower Decks are taken from the official
+   TheLCARS.com theme files (vendored for reference in thelcars/). */
 
 [data-lcars-palette="nemesis"] {
 	/* official Nemesis Blue: evening #26f · cool #69f · ghost #8bf ·
@@ -274,6 +272,42 @@ input[type="range"] {
 	--space-white: #fff8ee;
 }
 
+[data-lcars-palette="voyager"] {
+	/* VOY-flavored: periwinkles + salmon/peach accents */
+	--golden-orange: #f86;
+	--orange: #f80;
+	--gold: #fc9;
+	--sunglow: #fda;
+	--butterscotch: #e78a53;
+	--almond: #aab3f5;
+	--almond-creme: #ccd1ff;
+	--peach: #f86;
+	--sunflower: #ffe0cc;
+	--african-violet: #99f;
+	--lilac: #c9f;
+	--ice: #9cf;
+	--sky: #aaf;
+}
+
+[data-lcars-palette="picard"] {
+	/* PIC-flavored: muted copper/amber + steel */
+	--golden-orange: #e8a13d;
+	--orange: #d97c2b;
+	--gold: #f0c060;
+	--sunglow: #f5d98c;
+	--butterscotch: #c98a4b;
+	--almond: #d9b48f;
+	--almond-creme: #ecd9c0;
+	--peach: #e08a5e;
+	--sunflower: #f5e2c8;
+	--african-violet: #8fa3b8;
+	--lilac: #a98ac9;
+	--bluey: #7c96b8;
+	--ice: #a8c3d9;
+	--sky: #93b3cc;
+	--gray: #5a5a6a;
+}
+
 /* Utility classes the console markup uses. The Classic sheet defines these
    too, but the official V24 theme sheets name their colors differently —
    declaring them here (over the bridged vars) makes them theme-proof. */
@@ -297,23 +331,6 @@ input[type="range"] {
 .button-sky           { background-color: var(--sky) !important; }
 .button-almond        { background-color: var(--almond) !important; }
 
-[data-lcars-palette="mda"] {
-	--golden-orange: #d9b64a;
-	--orange: #c5a028;
-	--gold: #e8cc70;
-	--sunglow: #f0dc94;
-	--butterscotch: #b0c780;
-	--almond: #b5d9a8;
-	--almond-creme: #d0e8c5;
-	--peach: #9fcf90;
-	--sunflower: #d6eec0;
-	--african-violet: #7fc98a;
-	--lilac: #9fd9b0;
-	--bluey: #79c9a8;
-	--ice: #a8e8c8;
-	--sky: #90dfc0;
-	--lima-bean: #cde06a;
-}
 
 /* ── nav state ─────────────────────────────────────────────────────────── */
 

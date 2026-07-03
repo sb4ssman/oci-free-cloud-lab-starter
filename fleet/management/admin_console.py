@@ -1961,15 +1961,18 @@ _PAYLOAD_PRESETS: list[tuple[str, str, str, str]] = [
 
 _LC = "/static/lcars/thelcars"
 
-# LCARS color themes, cookie-selected. Each swaps the official TheLCARS.com
-# base stylesheet; console.css carries per-theme bridge vars for the console's
-# own components (keyed off data-lcars-palette on <html>).
+# LCARS color themes, cookie-selected. Each is a named-color override block in
+# console.css keyed off data-lcars-palette on <html>, over the Classic base.
+# (The official V24 theme stylesheets are vendored for hue reference only —
+# they predate the V26 chassis markup and break its layout if loaded.)
 _LCARS_PALETTES = [
-    ("classic",     "Classic",      "lcars-classic.css"),
-    ("nemesis",     "Nemesis Blue", "nemesis-blue.css"),
-    ("lower-decks", "Lower Decks",  "lower-decks.css"),
+    ("classic",     "Classic"),
+    ("nemesis",     "Nemesis Blue"),
+    ("lower-decks", "Lower Decks"),
+    ("voyager",     "Voyager"),
+    ("picard",      "Picard"),
 ]
-_LCARS_SHEETS = {key: sheet for key, _label, sheet in _LCARS_PALETTES}
+_LCARS_PALETTE_KEYS = {key for key, _label in _LCARS_PALETTES}
 
 _NAV_ITEMS = [
     ("01", "FLEET", "/",      "fleet"),
@@ -1992,14 +1995,13 @@ def _lcars_head(title: str, auto_refresh: int = 0) -> str:
     style = f' style="--ui-scale:{scale:g}"' if scale != 1.0 else ""
     palette = getattr(_ui_ctx, "palette", "classic")
     pal_attr = f' data-lcars-palette="{palette}"' if palette != "classic" else ""
-    sheet = _LCARS_SHEETS.get(palette, "lcars-classic.css")
     return (
         f'<!doctype html><html lang="en"{pal_attr}{style}><head>'
         '<meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">'
         f'{refresh}'
         f'<title>{html.escape(title)}</title>'
-        f'<link rel="stylesheet" href="{_LC}/{sheet}?v={STATIC_ASSET_VERSION}">'
+        f'<link rel="stylesheet" href="{_LC}/lcars-classic.css?v={STATIC_ASSET_VERSION}">'
         f'<link rel="stylesheet" href="/static/lcars/console.css?v={STATIC_ASSET_VERSION}">'
         '</head><body>'
     )
@@ -2078,9 +2080,17 @@ _C_RAIL_ITEMS = [
 
 def _c_frame(active: str, banner: str, content: str, fleet_h: str, footer: str,
              auto_refresh: int) -> str:
-    """Fully enclosed 'C' frame — top bar, left rail, bottom bar, all connected."""
+    """Fully enclosed 'C' frame — top bar, left rail, bottom bar, all connected.
+
+    The elbows are band piece + rail stem; the concave inner curves are
+    .cframe-cut overlays on the content column, so content hugs the frame.
+    """
     rail_parts = [
-        '<button onclick="topFunction(); playSound()" id="topBtn"><span class="hop">screen</span> top</button>'
+        '<button onclick="topFunction(); playSound()" id="topBtn"><span class="hop">screen</span> top</button>',
+        '<div class="cframe-stem cframe-stem--top">'
+        '<span class="elbow-code">Sector 47</span>'
+        '<span class="elbow-label">A1&#183;Flex</span>'
+        '</div>',
     ]
     for label, href, key, color in _C_RAIL_ITEMS:
         cur = " nav-current" if key == active else ""
@@ -2093,17 +2103,14 @@ def _c_frame(active: str, banner: str, content: str, fleet_h: str, footer: str,
         '<button class="background-red" '
         'onclick="playSoundAndRedirect(\'audio2\',\'/logout\')">Sign out</button>'
     )
+    rail_parts.append('<div class="cframe-stem cframe-stem--bottom">L4-7</div>')
     rail = "".join(rail_parts)
     setup_cur = ' class="background-almond nav-current"' if active == "settings" \
                 else ' class="background-almond"'
     refresh_label = f"Auto-refresh {auto_refresh}s" if auto_refresh else "LCARS 47.3"
     return (
-        '<div class="wrap">'
-        '<div class="cframe-elbow cframe-elbow--top">'
-        '<span class="elbow-code">Sector 47</span>'
-        '<span class="elbow-label">A1&#183;Flex</span>'
-        '</div>'
-        '<div class="cframe-right cframe-right--top">'
+        '<div class="wrap cframe-band">'
+        '<div class="cframe-elbow cframe-elbow--top"></div>'
         '<div class="cframe-bar">'
         f'<div class="bar-fill">{html.escape(banner)}&nbsp;&#149;&nbsp;<span id="Stardate"></span></div>'
         '<div class="cframe-chip"></div>'
@@ -2111,17 +2118,17 @@ def _c_frame(active: str, banner: str, content: str, fleet_h: str, footer: str,
         f'<div class="cframe-cap">{fleet_h}</div>'
         '</div>'
         '</div>'
-        '</div>'
         '<div class="wrap">'
         f'<div class="cframe-rail">{rail}</div>'
         '<div class="cframe-main">'
+        '<div class="cframe-cut cframe-cut--top"></div>'
+        '<div class="cframe-cut cframe-cut--bottom"></div>'
         f'<main>{content}</main>'
         f'{footer}'
         '</div>'
         '</div>'
-        '<div class="wrap">'
-        '<div class="cframe-elbow cframe-elbow--bottom">L4-7</div>'
-        '<div class="cframe-right cframe-right--bottom">'
+        '<div class="wrap cframe-band">'
+        '<div class="cframe-elbow cframe-elbow--bottom"></div>'
         '<div class="cframe-bar">'
         f'<div class="bar-fill">LCARS 47.3 &middot; {html.escape(active)}</div>'
         '<a class="background-gold" href="/tools">Tools</a>'
@@ -2129,7 +2136,6 @@ def _c_frame(active: str, banner: str, content: str, fleet_h: str, footer: str,
         '<a class="background-lilac" href="/audit">Audit log</a>'
         f'<a{setup_cur} href="/settings">Setup</a>'
         f'<div class="cframe-cap">{html.escape(refresh_label)}</div>'
-        '</div>'
         '</div>'
         '</div>'
     )
@@ -2765,7 +2771,7 @@ def lcars_settings_page(layout: str, scale: float) -> bytes:
         + "".join(
             f'<button{" class=" + chr(34) + "current" + chr(34) if key == palette else ""}'
             f' onclick="setLcarsPalette(\'{key}\')">{label}</button>'
-            for key, label, _sheet in _LCARS_PALETTES
+            for key, label in _LCARS_PALETTES
         )
         + '</div>'
         '<p class="meta-line">Variant palettes recolor the whole interface &middot; alerts stay red.</p>'
@@ -2820,7 +2826,7 @@ class Handler(BaseHTTPRequestHandler):
         _ui_ctx.scale  = min(1.4, max(0.7, scale))
         _ui_ctx.layout = "c" if cookies.get("lcars_layout") == "c" else "t"
         pal = cookies.get("lcars_palette", "classic")
-        _ui_ctx.palette = pal if pal in _LCARS_SHEETS else "classic"
+        _ui_ctx.palette = pal if pal in _LCARS_PALETTE_KEYS else "classic"
         mode = cookies.get("fleet_ui_mode", DEFAULT_UI_MODE)
         return "lcars" if mode == "lcars" else "standard"
 

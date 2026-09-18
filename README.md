@@ -178,7 +178,40 @@ call the same Python underneath.
 | `ssh-vm <name>` | SSH into any fleet VM (`management`, `worker`, `laboratory`) |
 | `bootstrap-mgmt-vm` | Re-apply full config to a running management VM |
 | `terminate-vm <name>` | Terminate a VM by name |
+| `rotate-secrets` | Push rotated secrets from `.env` to every reachable VM |
 | `hash_password.py` | Generate `ADMIN_PASSWORD_HASH` for `.env` |
+
+### Rotating a secret
+
+A secret does not live only in `.env`. Each VM keeps its own copy in
+`~/.config/cloud-lab/{role}.env`, and cloud-init bakes `GITHUB_TOKEN` directly
+into the clone URL in `~/cloud-lab/.git/config`. Editing `.env` alone leaves the
+fleet running the old value, and a revoked token breaks `git pull` on every VM.
+
+After changing `GITHUB_TOKEN`, `ADMIN_PASSWORD`, `QUEUE_API_KEY` or
+`FLEET_HEARTBEAT_TOKEN` in `.env`:
+
+```powershell
+admin\rotate-secrets.bat              REM push every secret set in .env
+admin\rotate-secrets.bat --token      REM just the GitHub token
+admin\rotate-secrets.bat --dry-run    REM show what would change
+```
+
+```sh
+sh admin/rotate-secrets.sh --token
+```
+
+It updates each role's env file, rewrites the token in the stored clone URL, and
+restarts that role's `cloud-lab-*` services. Only management is reachable from
+your laptop; worker and laboratory hop through it, and a role whose private IP is
+not yet in `.env` is skipped. Values are never printed and never passed as
+command-line arguments — argv is world-readable via `ps` on the remote host.
+
+Verify a rotated token by effect rather than by reading it back:
+
+```sh
+sh admin/ssh-vm.sh management "cd ~/cloud-lab && git ls-remote origin HEAD"
+```
 
 ---
 
